@@ -45,6 +45,7 @@ func run(ctx context.Context, args []string, in io.Reader, out, log io.Writer) e
 	watch := fs.Bool("watch", false, "observe lifecycle state in a Codex-owned background hook")
 	binary := fs.String("codex", "codex", "Codex executable used by the Stop watcher")
 	home := fs.String("codex-home", codexHome(), "Codex configuration directory for install")
+	trustBinary := fs.String("trust-codex", "codex", "local Codex executable used to trust installed hooks")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
@@ -61,7 +62,14 @@ func run(ctx context.Context, args []string, in io.Reader, out, log io.Writer) e
 		if !dbSpecified {
 			*dbPath = filepath.Join(*home, "cronex", "crons.sqlite3")
 		}
-		return install(*home, *dbPath, *binary, out)
+		if err := install(*home, *dbPath, *binary, out); err != nil {
+			return err
+		}
+		if err := trustInstalledHooks(ctx, *home, *dbPath, *binary, *trustBinary, out); err != nil {
+			return fmt.Errorf("Cronex installed, but automatic hook trust failed: %w; fix the error and rerun install, or review the hooks with /hooks", err)
+		}
+		fmt.Fprintln(out, "Restart Codex to load the installed configuration.")
+		return nil
 	}
 	path, err := filepath.Abs(*dbPath)
 	if err != nil {

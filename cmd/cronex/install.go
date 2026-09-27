@@ -7,16 +7,56 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"time"
 
 	"github.com/pelletier/go-toml/v2"
+	"github.com/pelletier/go-toml/v2/unstable"
 	"github.com/stbenjam/cronex/internal/cronex"
 	"golang.org/x/sys/unix"
 )
 
 const beginMarker = "# BEGIN CRONEX MANAGED CONFIG\n"
 const endMarker = "# END CRONEX MANAGED CONFIG\n"
+
+// Codex may append trust tables inside our marker comments. Keep their bytes
+// intact when replacing hook definitions; Codex still validates their hashes.
+func hookStateTables(block []byte) ([]byte, error) {
+	var parser unstable.Parser
+	parser.Reset(block)
+	var saved []byte
+	start, keep := 0, false
+	for parser.NextExpression() {
+		node := parser.Expression()
+		if node.Kind != unstable.Table && node.Kind != unstable.ArrayTable {
+			continue
+		}
+		key := node.Key()
+		var parts []string
+		position := 0
+		for key.Next() {
+			if len(parts) == 0 {
+				position = bytes.LastIndexByte(block[:key.Node().Raw.Offset], '\n') + 1
+			}
+			parts = append(parts, string(key.Node().Data))
+		}
+		if keep {
+			saved = append(saved, block[start:position]...)
+		}
+		start = position
+		keep = len(parts) >= 2 && parts[0] == "hooks" && parts[1] == "state"
+	}
+	if keep {
+		saved = append(saved, block[start:]...)
+	}
+	return saved, parser.Error()
+}
+
+func hookState(doc map[string]any) any {
+	hooks, _ := doc["hooks"].(map[string]any)
+	return hooks["state"]
+}
 
 // Keep the user's comments and formatting byte-for-byte. Only replace our
 // delimited section. Validate the complete TOML before any file is changed.
@@ -25,6 +65,7 @@ func mergeConfig(original, fragment []byte) ([]byte, error) {
 	if err := toml.Unmarshal(original, &parsed); err != nil {
 		return nil, fmt.Errorf("existing config is invalid TOML: %w", err)
 	}
+	state := hookState(parsed)
 	source := string(original)
 	block := beginMarker + string(fragment) + endMarker
 	start, end := strings.Index(source, beginMarker), strings.Index(source, endMarker)
@@ -33,6 +74,11 @@ func mergeConfig(original, fragment []byte) ([]byte, error) {
 		if start < 0 || end < start || strings.Count(source, beginMarker) != 1 || strings.Count(source, endMarker) != 1 {
 			return nil, errors.New("incomplete or duplicate Cronex managed markers; repair config.toml before installing")
 		}
+		preserved, err := hookStateTables(original[start+len(beginMarker) : end])
+		if err != nil {
+			return nil, fmt.Errorf("read managed hook trust: %w", err)
+		}
+		block = beginMarker + string(fragment) + string(preserved) + endMarker
 		candidate = source[:start] + block + source[end+len(endMarker):]
 	} else {
 		if servers, ok := parsed["mcp_servers"].(map[string]any); ok && servers["cronex"] != nil {
@@ -47,6 +93,9 @@ func mergeConfig(original, fragment []byte) ([]byte, error) {
 	parsed = nil
 	if err := toml.Unmarshal([]byte(candidate), &parsed); err != nil {
 		return nil, fmt.Errorf("merged config is invalid TOML (no changes made): %w", err)
+	}
+	if !reflect.DeepEqual(state, hookState(parsed)) {
+		return nil, errors.New("could not preserve existing hooks.state (no changes made)")
 	}
 	return []byte(candidate), nil
 }
@@ -158,6 +207,5 @@ func install(home, db, codex string, out io.Writer) error {
 	}
 	fmt.Fprintln(out, "Installed", destination)
 	fmt.Fprintln(out, "Configured MCP server and lifecycle hooks in", configPath)
-	fmt.Fprintln(out, "Restart Codex, then review and trust the Cronex hooks with /hooks.")
 	return nil
 }

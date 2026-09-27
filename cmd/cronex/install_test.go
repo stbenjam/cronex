@@ -23,10 +23,8 @@ func TestInstallPreservesConfigAndIsIdempotent(t *testing.T) {
 	if err := os.WriteFile(path, []byte(original), 0640); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("CODEX_HOME", home)
-	t.Setenv("CRONEX_DB", "")
 	var output bytes.Buffer
-	if err := run(context.Background(), []string{"install"}, strings.NewReader(""), &output, &output); err != nil {
+	if err := install(home, filepath.Join(home, "cronex", "crons.sqlite3"), "codex", &output); err != nil {
 		t.Fatal(err)
 	}
 	first, err := os.ReadFile(path)
@@ -173,5 +171,44 @@ func TestInstallPreservesSuspendedSchedules(t *testing.T) {
 	}
 	if generation, err := s.StartWatch(ctx, "session"); err != nil || generation != "" {
 		t.Fatalf("install reactivated closed session: %q %v", generation, err)
+	}
+}
+
+func TestMergePreservesCodexTrustInsideManagedBlock(t *testing.T) {
+	var fragment bytes.Buffer
+	if err := configFor(&fragment, "/cronex", "/db", "codex"); err != nil {
+		t.Fatal(err)
+	}
+	trust := "[hooks.state]\n\n[hooks.state.\"config:stop:0:0\"]\ntrusted_hash = 'sha256:existing'\nenabled = false\n\n"
+	for _, location := range []string{"before", "between", "after", "outside"} {
+		t.Run(location, func(t *testing.T) {
+			block, suffix := fragment.String(), ""
+			switch location {
+			case "before":
+				block = trust + block
+			case "between":
+				block = strings.Replace(block, "[[hooks.Stop]]", trust+"[[hooks.Stop]]", 1)
+			case "after":
+				block += trust
+			case "outside":
+				suffix = trust
+			}
+			merged, err := mergeConfig([]byte(beginMarker+block+endMarker+suffix), fragment.Bytes())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Contains(merged, []byte(trust)) || bytes.Count(merged, []byte(trust)) != 1 {
+				t.Fatal("trust bytes changed or duplicated")
+			}
+			second, err := mergeConfig(merged, fragment.Bytes())
+			if err != nil || !bytes.Equal(second, merged) {
+				t.Fatalf("trust-preserving reinstall not idempotent: %v", err)
+			}
+			updated := bytes.ReplaceAll(fragment.Bytes(), []byte("/db"), []byte("/new-db"))
+			changed, err := mergeConfig(merged, updated)
+			if err != nil || !bytes.Contains(changed, []byte(trust)) || !bytes.Contains(changed, []byte("/new-db")) {
+				t.Fatalf("merge changed trust state before explicit approval: %v", err)
+			}
+		})
 	}
 }

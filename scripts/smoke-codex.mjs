@@ -2,7 +2,7 @@
 // Requires Node >=22, codex on PATH, and `make build`.
 import assert from 'node:assert/strict';
 import { spawn, execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import http from 'node:http';
@@ -70,14 +70,19 @@ try {
   const remote = `ws://127.0.0.1:${port}`;
   const wrapper = join(root, 'queue-codex');
   writeFileSync(wrapper, `#!/bin/sh\nexec codex "$@" --remote '${remote}'\n`, { mode: 0o700 });
-  const fragment = execFileSync(binary, ['config', '--db', join(root, 'jobs.sqlite3'), '--codex', wrapper], { encoding: 'utf8', env });
   writeFileSync(join(root, 'config.toml'), `model = "test-model"\nmodel_provider = "mock"\n` +
     `[model_providers.mock]\nname = "Local smoke fixture"\nbase_url = "http://127.0.0.1:${model.address().port}/v1"\n` +
-    `wire_api = "responses"\nrequires_openai_auth = false\nsupports_websockets = false\n\n` + fragment);
+    `wire_api = "responses"\nrequires_openai_auth = false\nsupports_websockets = false\n\n` +
+    `[[hooks.SessionStart]]\n[[hooks.SessionStart.hooks]]\ntype = "command"\ncommand = "exit 79"\n`);
+  const installArgs = ['install', '--codex-home', root, '--db', join(root, 'jobs.sqlite3'), '--codex', wrapper];
+  execFileSync(binary, installArgs, { encoding: 'utf8', env });
+  const installedConfig = readFileSync(join(root, 'config.toml'), 'utf8');
+  execFileSync(binary, installArgs, { encoding: 'utf8', env });
+  assert.equal(readFileSync(join(root, 'config.toml'), 'utf8'), installedConfig, 'trusted reinstall is idempotent');
   let nextID = 1;
   const pending = new Map();
   async function startHost() {
-    app = spawn('codex', ['--dangerously-bypass-hook-trust', 'app-server', '--listen', remote], { env, cwd: workspace, stdio: ['ignore', 'pipe', 'pipe'] });
+    app = spawn('codex', ['app-server', '--listen', remote], { env, cwd: workspace, stdio: ['ignore', 'pipe', 'pipe'] });
     app.stderr.on('data', chunk => { stderr += chunk; });
     app.stdout.on('data', () => {});
     await until(async () => {
@@ -112,9 +117,14 @@ try {
     ws.send(JSON.stringify({ jsonrpc: '2.0', id, method, params }));
   });
   await startHost();
-  // Only trust the generated hooks in this isolated fixture, never user hooks.
-  const a = (await rpc('thread/start', { cwd: workspace, config: { bypass_hook_trust: true } })).thread.id;
-  const b = (await rpc('thread/start', { cwd: workspace, config: { bypass_hook_trust: true } })).thread.id;
+  const hookList = await rpc('hooks/list', { cwds: [root] });
+  const listed = hookList.data.flatMap(entry => entry.hooks);
+  const cronexHooks = listed.filter(hook => hook.command?.includes('/cronex/bin/cronex'));
+  assert.equal(cronexHooks.length, 9);
+  assert.ok(cronexHooks.every(hook => hook.trustStatus === 'trusted'), 'installer trusted all Cronex hooks');
+  assert.equal(listed.find(hook => hook.command === 'exit 79').trustStatus, 'untrusted', 'unrelated hook remains untrusted');
+  const a = (await rpc('thread/start', { cwd: workspace })).thread.id;
+  const b = (await rpc('thread/start', { cwd: workspace })).thread.id;
   async function call(threadId, tool, args = {}) {
     const result = await rpc('mcpServer/tool/call', { threadId, server: 'cronex', tool, arguments: args });
     assert.ok(!result.isError, JSON.stringify(result));
@@ -167,7 +177,7 @@ try {
 
   // Exercise both interruption of the first turn and interruption after idle.
   for (const firstTurn of [true, false]) {
-    const threadId = (await rpc('thread/start', { cwd: workspace, config: { bypass_hook_trust: true } })).thread.id;
+    const threadId = (await rpc('thread/start', { cwd: workspace })).thread.id;
     if (!firstTurn) {
       const initial = await rpc('turn/start', { threadId, input: [{ type: 'text', text: 'Finish normally.' }] });
       await until(() => completed(initial), 'initial turn finished');
@@ -190,7 +200,7 @@ try {
 
   // Two long prompts fit the configured context budget; a ninth due job must
   // survive the first batch and arrive at a later hook/queued turn.
-  const batchThread = (await rpc('thread/start', { cwd: workspace, config: { bypass_hook_trust: true } })).thread.id;
+  const batchThread = (await rpc('thread/start', { cwd: workspace })).thread.id;
   await warm(batchThread);
   const markers = [];
   for (let i = 0; i < 9; i++) {
@@ -217,7 +227,7 @@ try {
   assert.deepEqual(state().jobs.map(j => j.id).sort(), [other.id, archived.id].sort(), 'archive preserved both sessions');
 
   // Preserve an already accepted recurring prompt in Codex's paused queue.
-  const pendingThread = (await rpc('thread/start', { cwd: workspace, config: { bypass_hook_trust: true } })).thread.id;
+  const pendingThread = (await rpc('thread/start', { cwd: workspace })).thread.id;
   const pendingMarker = 'CRONEX_PENDING_RESTART';
   const held = await rpc('turn/start', { threadId: pendingThread, input: [{ type: 'text', text: 'CRONEX_HOLD_MODEL_PENDING' }] });
   await until(() => requests.some(r => contains(r, 'CRONEX_HOLD_MODEL_PENDING')), 'pending fixture turn started');
@@ -242,7 +252,7 @@ try {
   execFileSync('python3', ['-c', overdue, join(root, 'jobs.sqlite3'), restartJob.id, onceJob.id]);
   await startHost();
   assert.equal(await pendingCount(), 1, 'Codex preserved the existing queue item');
-  await rpc('thread/resume', { threadId: pendingThread, config: { bypass_hook_trust: true } });
+  await rpc('thread/resume', { threadId: pendingThread });
   const resumedHold = await rpc('turn/start', { threadId: pendingThread, input: [{ type: 'text', text: 'CRONEX_HOLD_MODEL_RESUMED_PENDING' }] });
   await until(() => requests.some(r => contains(r, 'CRONEX_HOLD_MODEL_RESUMED_PENDING')), 'resumed pending turn started');
   await rpc('turn/interrupt', { threadId: pendingThread, turnId: resumedHold.turn.id });
@@ -260,7 +270,7 @@ try {
   await call(pendingThread, 'CronDelete', { id: pendingJob.id });
   await rpc('thread/archive', { threadId: pendingThread });
 
-  await rpc('thread/resume', { threadId: b, config: { bypass_hook_trust: true } });
+  await rpc('thread/resume', { threadId: b });
   // Codex defers SessionStart until the first resumed turn. Opening a thread
   // alone doesn't re-arm hooks; a user message resumes scheduled delivery.
   assert.equal(state().sessions.find(s => s.id === b).ended, 1);
@@ -273,7 +283,7 @@ try {
   assert.equal(requests.filter(r => isWake(r, restartMarker)).length, 1, 'one recurring delivery, not 482');
   assert.equal(requests.filter(r => isWake(r, onceMarker)).length, 1, 'one one-shot delivery');
   assert.ok(state().sessions.some(s => s.id === a && s.ended === 1), 'resuming B did not reactivate A');
-  console.log('PASS: real Codex session routing, idle wakeup, active-turn handoff, recurring delivery, interruption recovery, complete batches, shutdown persistence, pending-queue deduplication, and coalesced delivery after restart.');
+  console.log('PASS: automatic scoped hook trust, idempotent reinstall, real Codex session routing, idle wakeup, active-turn handoff, recurring delivery, interruption recovery, complete batches, shutdown persistence, pending-queue deduplication, and coalesced delivery after restart.');
 } catch (error) {
   console.error(error);
   console.error('Codex stderr:', stderr.slice(-6000));

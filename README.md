@@ -22,7 +22,11 @@ make install CODEX_HOME=/path/to/codex-home
 ```
 
 This builds and installs `$CODEX_HOME/cronex/bin/cronex`, then configures the
-MCP server and lifecycle hooks in `$CODEX_HOME/config.toml`. `CODEX_HOME` defaults
+MCP server and lifecycle hooks in `$CODEX_HOME/config.toml` and trusts those
+Cronex hooks. The installer asks the local Codex app server for each hook's
+current hash, saves trust through Codex's config API, and verifies the result.
+It preserves trust and enabled/disabled settings for existing hooks; unrelated
+hooks are not automatically trusted. `CODEX_HOME` defaults
 to `~/.codex`. Existing settings, comments, and hooks are preserved; changed
 configurations are backed up beside the original. Dangling configuration symlinks are preserved with an error asking you to create
 the target first. Repeat installs update the
@@ -32,11 +36,14 @@ old Cronex entries first.
 
 For a manual installation, `make build` then `./bin/cronex config` prints a
 TOML fragment using the current binary path. The `install` and `config` commands
-both accept `--db` and `--codex` overrides; `install` also accepts `--codex-home`.
+both accept `--db` and `--codex` overrides; `install` also accepts `--codex-home`
+and `--trust-codex /path/to/codex` to select the local CLI used for hook trust.
+Trust discovery starts no agent threads or model turns. If it fails, installation
+reports an error; rerun after fixing it, or trust the hooks manually with `/hooks`.
 
-Restart Codex, then open **`/hooks` and trust the new hook definitions**. Codex
-skips untrusted hooks; registering only the MCP server is insufficient to wake
-an idle agent. Hooks are enabled by default; ensure `features.hooks` has not
+Restart Codex after installation. For manual configuration, open **`/hooks` and
+trust the new hook definitions**. Codex skips untrusted hooks; registering only
+the MCP server is insufficient to wake an idle agent. Hooks are enabled by default; ensure `features.hooks` has not
 been disabled. Hook scripts must be runnable in the Codex execution environment.
 Use `/mcp` to check that the Cronex server connected.
 
