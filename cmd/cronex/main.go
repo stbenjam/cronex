@@ -107,7 +107,7 @@ func run(ctx context.Context, args []string, in io.Reader, out, log io.Writer) e
 		return s.EndSession(ctx, payload.SessionID)
 	case "SubagentStart":
 		if payload.IsSubagent() {
-			return s.EndSession(ctx, payload.AgentID)
+			return s.DiscardSession(ctx, payload.AgentID)
 		}
 		return nil
 	case "UserPromptSubmit":

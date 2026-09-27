@@ -5,8 +5,8 @@ created them**. It exposes exactly `CronCreate`, `CronList`, and `CronDelete`.
 
 The asynchronous `Stop` hook waits outside the model, then wakes its owning
 thread with `codex queue --thread … --message …`. A synchronous `PostToolUse`
-hook injects due prompts during ongoing work. `SessionEnd` deletes that
-session's jobs and invalidates its watcher. Multiple sessions can use the same
+hook injects due prompts during ongoing work. `SessionEnd` preserves that
+session's jobs and invalidates its watcher until the session resumes. Multiple sessions can use the same
 SQLite database, even from the same directory or different worktrees.
 
 ## Setup
@@ -157,15 +157,29 @@ the PR once and reconcile the jobs before returning to idle.
    the current time, coalescing missed ticks into one prompt. Interval jobs
    retain their original phase; cron jobs follow their timezone's calendar
    and daylight-saving rules.
-6. `SessionStart` preserves jobs and active watcher state on resume/compaction.
-   `SessionEnd` deletes only its session's jobs and keeps a small
-   ended-session marker so an in-flight MCP call cannot recreate them.
+6. `SessionEnd` suspends delivery, invalidates the watcher, and clears transient
+   turn state while preserving jobs and their deadlines. An ended-session marker
+   prevents an in-flight MCP call from creating more jobs. `SessionStart`
+   reactivates the same session; compaction preserves its active turn state.
+   After a restart, resume the original thread and send a message to re-arm
+   delivery. Codex 0.157.1 defers `SessionStart` until that first resumed turn;
+   merely opening the conversation does not restart the watcher.
+7. On resume, each unexpired overdue job produces one catch-up run, regardless
+   of how many intervals were missed. Recurring jobs then advance to their next
+   future deadline; overdue one-shot jobs run once and are removed. There is no
+   per-tick backlog: 482 missed intervals still produce one run per job.
 
 Practical limits:
 
 - Requires a running Codex host/daemon able to accept `codex queue`. Async
   hook output alone does **not** start a new turn. This is a session scheduler,
   not an OS service that launches Codex after shutdown.
+- Codex currently reports the same `SessionEnd` reason (`other`) for normal
+  shutdown, idle unloading, archive, and deletion. Cronex therefore preserves
+  schedules for all of them. Use `CronDelete` before permanently abandoning a
+  thread, or set `expires_at` when scheduling. Archiving or deleting a thread
+  does not cancel its stored jobs; without expiry, those rows remain until
+  explicitly deleted. See the [SessionEnd contract](https://learn.chatgpt.com/docs/hooks#sessionend).
 - After an interrupted turn, Codex 0.157.1 pauses consumption of queued work.
   Cronex still delivers due prompts into that queue; they execute when you
   explicitly resume queued work in Codex. Cronex does not clear the host pause.
@@ -179,6 +193,8 @@ Practical limits:
   or concurrently accepted prompt.
 - A hard kill can skip `SessionEnd`, leaving persisted jobs. They remain
   isolated to that session ID and can be inspected/deleted upon resuming it.
+- Versions that deleted jobs on `SessionEnd` cannot recover those jobs through
+  an upgrade. Recreate any already-lost schedules once in their original thread.
 - Hooks fail open on database errors, logging diagnostics to stderr. This
   preserves the agent's work, but a failed watcher cannot guarantee a
   wake until a later Stop or UserPromptSubmit starts its replacement. The lightweight probe retries on the next tool.
@@ -219,11 +235,12 @@ go test ./internal/cronex -run '^$' -bench BenchmarkNotDue -benchmem
 
 Tests exercise the official MCP SDK client/server lifecycle, per-call session
 routing, competing database connections, lease recovery, queue failures,
-cleanup, coalescing, expiry, timezone scheduling, hook output, and idempotent
+suspension/resume, coalescing, expiry, timezone scheduling, hook output, and idempotent
 installation. `make smoke` requires Node 22+, Python 3, and Codex on PATH. It
 uses an isolated temporary Codex home and a local fake Responses endpoint to
 verify actual MCP routing, idle wakeup, active-turn handoff, recurring delivery,
-interruption recovery, batching, and SessionEnd cleanup. It trusts only
+interruption recovery, batching, graceful host shutdown/restart, and one catch-up
+run per task after simulated long downtime. It trusts only
 the generated test hooks in that temporary instance.
 
 The integration follows Codex's [hook contract](https://learn.chatgpt.com/docs/hooks).

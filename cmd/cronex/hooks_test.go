@@ -73,4 +73,30 @@ func TestRootLifecycleAndSubagentExclusion(t *testing.T) {
 	if _, err := s.Create(ctx, "parent", cronex.CreateInput{Prompt: "registered", EverySeconds: 60}, time.Now()); err != nil {
 		t.Fatal(err)
 	}
+	hook("SessionEnd", "", "")
+	jobs, err = s.List(ctx, "parent", time.Now())
+	if err != nil || len(jobs) != 1 {
+		t.Fatalf("SessionEnd lost persistent jobs: %+v %v", jobs, err)
+	}
+	if ready, err := s.CanDeliver(ctx, "parent", gen); err != nil || ready {
+		t.Fatalf("SessionEnd left watcher running: %v %v", ready, err)
+	}
+	hook("SessionStart", "", "")
+	jobs, err = s.List(ctx, "parent", time.Now())
+	if err != nil || len(jobs) != 1 {
+		t.Fatalf("SessionStart lost persistent jobs: %+v %v", jobs, err)
+	}
+
+	// Legacy child schedules still get removed, without deleting parent jobs.
+	if err := s.EnsureSession(ctx, "child", true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Create(ctx, "child", cronex.CreateInput{Prompt: "legacy", EverySeconds: 60}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	hook("SubagentStart", "child", "current")
+	jobs, err = s.List(ctx, "child", time.Now())
+	if err != nil || len(jobs) != 0 {
+		t.Fatalf("legacy child jobs retained: %+v %v", jobs, err)
+	}
 }

@@ -151,7 +151,18 @@ func (s *Store) Delete(ctx context.Context, session, id string) (bool, error) {
 	return n > 0, err
 }
 
+// EndSession suspends delivery without discarding schedules. Codex uses the
+// same SessionEnd reason for resumable shutdowns and permanent deletion.
 func (s *Store) EndSession(ctx context.Context, session string) error {
+	return s.endSession(ctx, session, false)
+}
+
+// DiscardSession also removes legacy jobs belonging to unsupported subagents.
+func (s *Store) DiscardSession(ctx context.Context, session string) error {
+	return s.endSession(ctx, session, true)
+}
+
+func (s *Store) endSession(ctx context.Context, session string, discard bool) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -163,8 +174,10 @@ func (s *Store) EndSession(ctx context.Context, session string) error {
 	if _, err = tx.ExecContext(ctx, `DELETE FROM session_state WHERE session_id=?`, session); err != nil {
 		return err
 	}
-	if _, err = tx.ExecContext(ctx, `DELETE FROM jobs WHERE session_id=?`, session); err != nil {
-		return err
+	if discard {
+		if _, err = tx.ExecContext(ctx, `DELETE FROM jobs WHERE session_id=?`, session); err != nil {
+			return err
+		}
 	}
 	return tx.Commit()
 }

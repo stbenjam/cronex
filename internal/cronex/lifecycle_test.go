@@ -5,10 +5,131 @@ import (
 	"database/sql"
 	"encoding/json"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestShutdownAndResumeCoalescesMissedRuns(t *testing.T) {
+	s, path := testStore(t)
+	oneShot := false
+	for _, in := range []CreateInput{
+		{Prompt: "interval", EverySeconds: 60},
+		{Prompt: "calendar", Cron: "* * * * *"},
+		{Prompt: "one-shot", EverySeconds: 60, Recurring: &oneShot},
+		{Prompt: "expired", EverySeconds: 60, ExpiresAt: epoch.Add(2 * time.Minute).Format(time.RFC3339)},
+	} {
+		create(t, s, "A", in)
+	}
+	before, err := s.List(ctx, "A", epoch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old, err := s.StartWatch(ctx, "A")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.EndSession(ctx, "A"); err != nil {
+		t.Fatal(err)
+	}
+	// Repeated shutdown, stale turn hooks, and an MCP reconnect cannot revive it.
+	if err := s.EndSession(ctx, "A"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.EnsureSession(ctx, "A", false); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.FinishTurn(ctx, "A", "initial"); err != nil {
+		t.Fatal(err)
+	}
+	if generation, err := s.StartWatch(ctx, "A"); err != nil || generation != "" {
+		t.Fatalf("closed session started watcher: %q %v", generation, err)
+	}
+	resumedAt := epoch.Add(48 * time.Hour)
+	for _, generation := range []string{old, ""} {
+		d, err := s.Claim(ctx, "A", generation, resumedAt)
+		if err != nil || len(d.Jobs) != 0 {
+			t.Fatalf("closed session delivered: %+v %v", d, err)
+		}
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s, err = Open(path, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	after, err := s.List(ctx, "A", epoch)
+	if err != nil || !reflect.DeepEqual(before, after) {
+		t.Fatalf("restart changed schedules: %+v %v", after, err)
+	}
+	if err := s.EnsureSession(ctx, "A", true); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.BeginTurn(ctx, "A", "resumed-turn"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.FinishTurn(ctx, "A", "resumed-turn"); err != nil {
+		t.Fatal(err)
+	}
+	current, err := s.StartWatch(ctx, "A")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ready, err := s.CanDeliver(ctx, "A", old); err != nil || ready {
+		t.Fatalf("old watcher survived resume: %v %v", ready, err)
+	}
+	d, err := s.Claim(ctx, "A", current, resumedAt)
+	if err != nil || len(d.Jobs) != 3 {
+		t.Fatalf("want one delivery per unexpired task, got %+v %v", d, err)
+	}
+	seen := map[string]bool{}
+	for _, j := range d.Jobs {
+		if seen[j.ID] || j.Prompt == "expired" {
+			t.Fatalf("duplicate or expired task: %+v", j)
+		}
+		seen[j.ID] = true
+	}
+	if err := s.Complete(ctx, d, true, resumedAt); err != nil {
+		t.Fatal(err)
+	}
+	if next, err := s.Claim(ctx, "A", current, resumedAt); err != nil || len(next.Jobs) != 0 {
+		t.Fatalf("missed intervals replayed: %+v %v", next, err)
+	}
+	jobs, err := s.List(ctx, "A", resumedAt)
+	if err != nil || len(jobs) != 2 {
+		t.Fatalf("one-shot retained or recurring job lost: %+v %v", jobs, err)
+	}
+	for _, j := range jobs {
+		if !j.NextRunAt.Equal(resumedAt.Add(time.Minute)) {
+			t.Fatalf("schedule did not advance past downtime: %+v", j)
+		}
+	}
+}
+
+func TestSuspensionKeepsInFlightLease(t *testing.T) {
+	s, _ := testStore(t)
+	create(t, s, "A", CreateInput{Prompt: "pending", EverySeconds: 1})
+	now := epoch.Add(time.Second)
+	d, err := s.Claim(ctx, "A", "", now)
+	if err != nil || len(d.Jobs) != 1 {
+		t.Fatalf("claim: %+v %v", d, err)
+	}
+	if err := s.EndSession(ctx, "A"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.EnsureSession(ctx, "A", true); err != nil {
+		t.Fatal(err)
+	}
+	if duplicate, err := s.Claim(ctx, "A", "", now); err != nil || len(duplicate.Jobs) != 0 {
+		t.Fatalf("resume cleared an in-flight lease: %+v %v", duplicate, err)
+	}
+	if retry, err := s.Claim(ctx, "A", "", now.Add(leaseTime)); err != nil || len(retry.Jobs) != 1 {
+		t.Fatalf("abandoned lease did not recover: %+v %v", retry, err)
+	}
+}
 
 func TestDelayedStopCannotEnableIdleDelivery(t *testing.T) {
 	s, _ := testStore(t)

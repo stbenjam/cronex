@@ -42,7 +42,7 @@ func create(t *testing.T, s *Store, session string, in CreateInput) Job {
 	return j
 }
 
-func TestSessionIsolationAndCleanup(t *testing.T) {
+func TestSessionIsolationAndSuspension(t *testing.T) {
 	s, _ := testStore(t)
 	a := create(t, s, "A", CreateInput{Prompt: "A", EverySeconds: 600})
 	b := create(t, s, "B", CreateInput{Prompt: "B", EverySeconds: 600})
@@ -63,8 +63,8 @@ func TestSessionIsolationAndCleanup(t *testing.T) {
 		t.Fatal("late MCP request resurrected ended session")
 	}
 	jobs, err = s.List(ctx, "A", epoch)
-	if err != nil || len(jobs) != 0 {
-		t.Fatalf("cleanup: %+v %v", jobs, err)
+	if err != nil || len(jobs) != 1 || jobs[0].ID != a.ID {
+		t.Fatalf("suspension lost job: %+v %v", jobs, err)
 	}
 	jobs, err = s.List(ctx, "B", epoch)
 	if err != nil || len(jobs) != 1 || jobs[0].ID != b.ID {

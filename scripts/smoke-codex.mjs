@@ -74,34 +74,44 @@ try {
   writeFileSync(join(root, 'config.toml'), `model = "test-model"\nmodel_provider = "mock"\n` +
     `[model_providers.mock]\nname = "Local smoke fixture"\nbase_url = "http://127.0.0.1:${model.address().port}/v1"\n` +
     `wire_api = "responses"\nrequires_openai_auth = false\nsupports_websockets = false\n\n` + fragment);
-  app = spawn('codex', ['--dangerously-bypass-hook-trust', 'app-server', '--listen', remote], { env, cwd: workspace, stdio: ['ignore', 'pipe', 'pipe'] });
-  app.stderr.on('data', chunk => { stderr += chunk; });
-  app.stdout.on('data', () => {});
-  await until(async () => {
-    const candidate = new WebSocket(remote);
-    const opened = await new Promise(resolve => {
-      candidate.addEventListener('open', () => resolve(true), { once: true });
-      candidate.addEventListener('error', () => resolve(false), { once: true });
-    });
-    if (opened) ws = candidate;
-    return opened;
-  }, 'app-server listener');
   let nextID = 1;
   const pending = new Map();
-  ws.addEventListener('message', ({ data }) => {
-    const message = JSON.parse(data);
-    if (message.id !== undefined && pending.has(message.id)) {
-      const { resolve, reject } = pending.get(message.id); pending.delete(message.id);
-      if (message.error) reject(new Error(JSON.stringify(message.error))); else resolve(message.result);
-    } else { notifications.push(message); }
-  });
+  async function startHost() {
+    app = spawn('codex', ['--dangerously-bypass-hook-trust', 'app-server', '--listen', remote], { env, cwd: workspace, stdio: ['ignore', 'pipe', 'pipe'] });
+    app.stderr.on('data', chunk => { stderr += chunk; });
+    app.stdout.on('data', () => {});
+    await until(async () => {
+      const candidate = new WebSocket(remote);
+      const opened = await new Promise(resolve => {
+        candidate.addEventListener('open', () => resolve(true), { once: true });
+        candidate.addEventListener('error', () => resolve(false), { once: true });
+      });
+      if (opened) ws = candidate;
+      return opened;
+    }, 'app-server listener');
+    ws.addEventListener('message', ({ data }) => {
+      const message = JSON.parse(data);
+      if (message.id !== undefined && pending.has(message.id)) {
+        const { resolve, reject } = pending.get(message.id); pending.delete(message.id);
+        if (message.error) reject(new Error(JSON.stringify(message.error))); else resolve(message.result);
+      } else { notifications.push(message); }
+    });
+    await rpc('initialize', { clientInfo: { name: 'cronex-smoke', version: '1' }, capabilities: { experimentalApi: true } });
+  }
+  async function stopHost() {
+    const exited = once(app, 'exit');
+    app.kill('SIGTERM');
+    await Promise.race([exited, sleep(10000)]);
+    assert.ok(app.exitCode !== null || app.signalCode !== null, 'host exited gracefully');
+    ws.close();
+  }
   const rpc = (method, params) => new Promise((resolve, reject) => {
     const id = nextID++;
     const timer = setTimeout(() => { pending.delete(id); reject(new Error(`RPC timeout: ${method}`)); }, 15000);
     pending.set(id, { resolve: value => { clearTimeout(timer); resolve(value); }, reject: error => { clearTimeout(timer); reject(error); } });
     ws.send(JSON.stringify({ jsonrpc: '2.0', id, method, params }));
   });
-  await rpc('initialize', { clientInfo: { name: 'cronex-smoke', version: '1' }, capabilities: { experimentalApi: true } });
+  await startHost();
   // Only trust the generated hooks in this isolated fixture, never user hooks.
   const a = (await rpc('thread/start', { cwd: workspace, config: { bypass_hook_trust: true } })).thread.id;
   const b = (await rpc('thread/start', { cwd: workspace, config: { bypass_hook_trust: true } })).thread.id;
@@ -194,15 +204,46 @@ try {
   await rpc('thread/archive', { threadId: batchThread });
 
   const other = await call(b, 'CronCreate', { prompt: 'Keep B', every_seconds: 28800 });
-  await call(a, 'CronCreate', { prompt: 'Clean up A', every_seconds: 28800 });
+  const archived = await call(a, 'CronCreate', { prompt: 'Preserve archived A', every_seconds: 28800 });
   await rpc('thread/archive', { threadId: a });
-  // SessionEnd happens as the real thread shuts down. Inspect our own scratch DB.
-  const query = `import sqlite3,json,sys\nc=sqlite3.connect(sys.argv[1]);print(json.dumps(c.execute('SELECT session_id,id FROM jobs').fetchall()))`;
+  // Archive and shutdown share the same SessionEnd reason. Both must preserve
+  // jobs while disabling delivery. Inspect only this fixture's scratch DB.
+  const query = `import sqlite3,json,sys\nc=sqlite3.connect(sys.argv[1]);c.row_factory=sqlite3.Row;print(json.dumps({'jobs':[dict(r) for r in c.execute('SELECT session_id,id,next_ms FROM jobs')],'sessions':[dict(r) for r in c.execute('SELECT id,ended,generation FROM sessions')]}))`;
+  const state = () => JSON.parse(execFileSync('python3', ['-c', query, join(root, 'jobs.sqlite3')], { encoding: 'utf8' }));
   await until(() => {
-    const rows = JSON.parse(execFileSync('python3', ['-c', query, join(root, 'jobs.sqlite3')], { encoding: 'utf8' }));
-    return rows.length === 1 && rows[0][0] === b && rows[0][1] === other.id;
-  }, 'SessionEnd cleanup');
-  console.log('PASS: real Codex session routing, idle wakeup, active-turn handoff, recurring delivery, first-turn/idle interruption recovery, complete batches, and SessionEnd cleanup.');
+    const snapshot = state();
+    return snapshot.sessions.some(s => s.id === a && s.ended === 1 && s.generation === '');
+  }, 'SessionEnd suspension');
+  assert.deepEqual(state().jobs.map(j => j.id).sort(), [other.id, archived.id].sort(), 'archive preserved both sessions');
+
+  const restartMarker = 'CRONEX_RESTART_RECURRING';
+  const onceMarker = 'CRONEX_RESTART_ONCE';
+  const restartJob = await call(b, 'CronCreate', { prompt: restartMarker, every_seconds: 600 });
+  const onceJob = await call(b, 'CronCreate', { prompt: onceMarker, every_seconds: 600, recurring: false });
+  const beforeShutdown = state().jobs;
+  await stopHost();
+  assert.deepEqual(state().jobs, beforeShutdown, 'host shutdown preserved deadlines and IDs');
+  assert.ok(state().sessions.every(s => s.ended === 1 && s.generation === ''), 'shutdown disabled all watchers');
+
+  // Simulate 482 missed intervals without making this integration test wait
+  // several days. The host is stopped, and this is a disposable test database.
+  const overdue = `import sqlite3,json,sys,datetime\nc=sqlite3.connect(sys.argv[1]);now=datetime.datetime.now(datetime.timezone.utc);next_at=now-datetime.timedelta(seconds=600*482)\nfor id in sys.argv[2:]:\n row=c.execute('SELECT body FROM jobs WHERE id=?',(id,)).fetchone();j=json.loads(row[0]);j['next_run_at']=next_at.isoformat();j['created_at']=(next_at-datetime.timedelta(seconds=600)).isoformat();c.execute('UPDATE jobs SET body=?,next_ms=? WHERE id=?',(json.dumps(j),int(next_at.timestamp()*1000),id))\nc.commit()`;
+  execFileSync('python3', ['-c', overdue, join(root, 'jobs.sqlite3'), restartJob.id, onceJob.id]);
+  await startHost();
+  await rpc('thread/resume', { threadId: b, config: { bypass_hook_trust: true } });
+  // Codex defers SessionStart until the first resumed turn. Opening a thread
+  // alone doesn't re-arm hooks; a user message resumes scheduled delivery.
+  assert.equal(state().sessions.find(s => s.id === b).ended, 1);
+  await warm(b);
+  await until(() => requests.some(r => isWake(r, restartMarker)) && requests.some(r => isWake(r, onceMarker)), 'overdue tasks delivered after restart', 20000);
+  await until(async () => !(await call(b, 'CronList')).jobs.some(j => j.id === onceJob.id), 'resumed one-shot acknowledged');
+  const resumedJobs = (await call(b, 'CronList')).jobs;
+  assert.ok(Date.parse(resumedJobs.find(j => j.id === restartJob.id).next_run_at) > Date.now(), 'recurrence advanced beyond missed intervals');
+  await sleep(1200);
+  assert.equal(requests.filter(r => isWake(r, restartMarker)).length, 1, 'one recurring delivery, not 482');
+  assert.equal(requests.filter(r => isWake(r, onceMarker)).length, 1, 'one one-shot delivery');
+  assert.ok(state().sessions.some(s => s.id === a && s.ended === 1), 'resuming B did not reactivate A');
+  console.log('PASS: real Codex session routing, idle wakeup, active-turn handoff, recurring delivery, interruption recovery, complete batches, shutdown persistence, and coalesced delivery after restart.');
 } catch (error) {
   console.error(error);
   console.error('Codex stderr:', stderr.slice(-6000));
