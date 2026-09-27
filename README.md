@@ -186,6 +186,28 @@ Practical limits:
   an authentication boundary against another process with access to your
   user account/database. Cronex does not expose an HTTP listener.
 
+### Why polling?
+
+Cronex deliberately uses a sleeping background watcher that checks SQLite about
+once per second. For the intended workload of fewer than 10 crons across roughly
+10 Codex sessions, this means around 10 small state queries per second when all
+10 watchers are running. Polling is per session, not per cron. Waiting uses no
+model tokens or API calls, and each check runs inside the existing watcher
+process without launching another process.
+
+Polling keeps newly created jobs, deletions, turn state changes, and watcher
+replacement visible through one source of truth: SQLite. Filesystem notifications
+could avoid periodic wakeups, but would add platform-specific behavior and races
+around notification delivery and database commits. At this scale, the expected
+resource savings do not justify that complexity. This is a design tradeoff,
+not a measured CPU or battery guarantee.
+
+Changes are normally noticed within about one second. The watcher sleeps for
+less when a known deadline is nearer; this is not a real-time execution guarantee,
+and Codex's queue and interrupt behavior still determine when the agent runs.
+Event-driven waiting is worth revisiting if substantially more concurrent
+sessions or measured idle resource usage make polling a problem.
+
 ## Development
 
 ```sh
