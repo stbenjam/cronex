@@ -216,6 +216,17 @@ try {
   }, 'SessionEnd suspension');
   assert.deepEqual(state().jobs.map(j => j.id).sort(), [other.id, archived.id].sort(), 'archive preserved both sessions');
 
+  // Preserve an already accepted recurring prompt in Codex's paused queue.
+  const pendingThread = (await rpc('thread/start', { cwd: workspace, config: { bypass_hook_trust: true } })).thread.id;
+  const pendingMarker = 'CRONEX_PENDING_RESTART';
+  const held = await rpc('turn/start', { threadId: pendingThread, input: [{ type: 'text', text: 'CRONEX_HOLD_MODEL_PENDING' }] });
+  await until(() => requests.some(r => contains(r, 'CRONEX_HOLD_MODEL_PENDING')), 'pending fixture turn started');
+  const pendingJob = await call(pendingThread, 'CronCreate', { prompt: pendingMarker, every_seconds: 1 });
+  await rpc('turn/interrupt', { threadId: pendingThread, turnId: held.turn.id });
+  await until(() => completed(held), 'pending fixture interrupted');
+  const pendingCount = async () => (await rpc('thread/queue/list', { threadId: pendingThread })).data.filter(q => JSON.stringify(q.input).includes(pendingMarker)).length;
+  await until(async () => (await pendingCount()) === 1, 'initial prompt accepted in paused queue');
+
   const restartMarker = 'CRONEX_RESTART_RECURRING';
   const onceMarker = 'CRONEX_RESTART_ONCE';
   const restartJob = await call(b, 'CronCreate', { prompt: restartMarker, every_seconds: 600 });
@@ -230,6 +241,25 @@ try {
   const overdue = `import sqlite3,json,sys,datetime\nc=sqlite3.connect(sys.argv[1]);now=datetime.datetime.now(datetime.timezone.utc);next_at=now-datetime.timedelta(seconds=600*482)\nfor id in sys.argv[2:]:\n row=c.execute('SELECT body FROM jobs WHERE id=?',(id,)).fetchone();j=json.loads(row[0]);j['next_run_at']=next_at.isoformat();j['created_at']=(next_at-datetime.timedelta(seconds=600)).isoformat();c.execute('UPDATE jobs SET body=?,next_ms=? WHERE id=?',(json.dumps(j),int(next_at.timestamp()*1000),id))\nc.commit()`;
   execFileSync('python3', ['-c', overdue, join(root, 'jobs.sqlite3'), restartJob.id, onceJob.id]);
   await startHost();
+  assert.equal(await pendingCount(), 1, 'Codex preserved the existing queue item');
+  await rpc('thread/resume', { threadId: pendingThread, config: { bypass_hook_trust: true } });
+  const resumedHold = await rpc('turn/start', { threadId: pendingThread, input: [{ type: 'text', text: 'CRONEX_HOLD_MODEL_RESUMED_PENDING' }] });
+  await until(() => requests.some(r => contains(r, 'CRONEX_HOLD_MODEL_RESUMED_PENDING')), 'resumed pending turn started');
+  await rpc('turn/interrupt', { threadId: pendingThread, turnId: resumedHold.turn.id });
+  await until(() => completed(resumedHold), 'resumed pending turn interrupted');
+  await sleep(2200);
+  assert.equal(await pendingCount(), 1, 'resume must not queue another copy of an already pending task');
+  // The active PostToolUse path must also leave the pending task alone.
+  const pendingProbe = await rpc('turn/start', { threadId: pendingThread, input: [{ type: 'text', text: 'CRONEX_TOOL_CASE:pending' }] });
+  await until(() => completed(pendingProbe), 'pending probe turn completed');
+  assert.ok(!requests.some(r => JSON.stringify(r.input.filter(i => i.role === 'user').at(-1)).includes('CRONEX_TOOL_CASE:pending') &&
+    contains(r, pendingMarker)), 'PostToolUse did not duplicate an already queued task');
+  // A normal user turn resumes Codex's queue. Receipt must clear the pending
+  // marker so subsequent scheduled runs can execute too.
+  await until(() => requests.filter(r => isWake(r, pendingMarker)).length >= 2, 'queue acknowledgement allows future recurring ticks', 15000);
+  await call(pendingThread, 'CronDelete', { id: pendingJob.id });
+  await rpc('thread/archive', { threadId: pendingThread });
+
   await rpc('thread/resume', { threadId: b, config: { bypass_hook_trust: true } });
   // Codex defers SessionStart until the first resumed turn. Opening a thread
   // alone doesn't re-arm hooks; a user message resumes scheduled delivery.
@@ -243,7 +273,7 @@ try {
   assert.equal(requests.filter(r => isWake(r, restartMarker)).length, 1, 'one recurring delivery, not 482');
   assert.equal(requests.filter(r => isWake(r, onceMarker)).length, 1, 'one one-shot delivery');
   assert.ok(state().sessions.some(s => s.id === a && s.ended === 1), 'resuming B did not reactivate A');
-  console.log('PASS: real Codex session routing, idle wakeup, active-turn handoff, recurring delivery, interruption recovery, complete batches, shutdown persistence, and coalesced delivery after restart.');
+  console.log('PASS: real Codex session routing, idle wakeup, active-turn handoff, recurring delivery, interruption recovery, complete batches, shutdown persistence, pending-queue deduplication, and coalesced delivery after restart.');
 } catch (error) {
   console.error(error);
   console.error('Codex stderr:', stderr.slice(-6000));

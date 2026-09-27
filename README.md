@@ -168,6 +168,10 @@ the PR once and reconcile the jobs before returning to idle.
    of how many intervals were missed. Recurring jobs then advance to their next
    future deadline; overdue one-shot jobs run once and are removed. There is no
    per-tick backlog: 482 missed intervals still produce one run per job.
+   If that job already has a prompt waiting in Codex's queue, Cronex suppresses
+   further deliveries across restarts and active tool calls. When Codex starts
+   the queued prompt, its `UserPromptSubmit` hook acknowledges the delivery and
+   advances the schedule past any ticks missed while waiting.
 
 Practical limits:
 
@@ -183,6 +187,9 @@ Practical limits:
 - After an interrupted turn, Codex 0.157.1 pauses consumption of queued work.
   Cronex still delivers due prompts into that queue; they execute when you
   explicitly resume queued work in Codex. Cronex does not clear the host pause.
+- Removing a queued prompt manually does not notify Cronex. To restart that
+  task, delete its cron with `CronDelete` and recreate it; otherwise its pending
+  delivery marker continues to suppress further runs.
 - During active work, delivery happens at supported tool boundaries or via
   Codex's queue. A hook cannot interrupt an individual long-running model
   request or tool. Hosted tools may not emit `PostToolUse`.
@@ -239,7 +246,8 @@ suspension/resume, coalescing, expiry, timezone scheduling, hook output, and ide
 installation. `make smoke` requires Node 22+, Python 3, and Codex on PATH. It
 uses an isolated temporary Codex home and a local fake Responses endpoint to
 verify actual MCP routing, idle wakeup, active-turn handoff, recurring delivery,
-interruption recovery, batching, graceful host shutdown/restart, and one catch-up
+interruption recovery, batching, graceful host shutdown/restart, pending queue
+deduplication, and one catch-up
 run per task after simulated long downtime. It trusts only
 the generated test hooks in that temporary instance.
 

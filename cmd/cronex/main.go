@@ -111,7 +111,10 @@ func run(ctx context.Context, args []string, in io.Reader, out, log io.Writer) e
 		}
 		return nil
 	case "UserPromptSubmit":
-		return s.BeginTurn(ctx, payload.SessionID, payload.TurnID)
+		if err := s.BeginTurn(ctx, payload.SessionID, payload.TurnID); err != nil {
+			return err
+		}
+		return s.AcknowledgeQueue(ctx, payload.SessionID, payload.DeliveryToken(), time.Now())
 	case "PostToolUse":
 		return cronex.Probe(ctx, s, payload.SessionID, out, time.Now())
 	case "Stop", "Interrupt":

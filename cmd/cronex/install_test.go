@@ -7,8 +7,10 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/pelletier/go-toml/v2"
+	"github.com/stbenjam/cronex/internal/cronex"
 )
 
 func TestInstallPreservesConfigAndIsIdempotent(t *testing.T) {
@@ -139,5 +141,37 @@ func TestInstallPreservesDanglingConfigSymlink(t *testing.T) {
 	}
 	if actual, err := os.Readlink(path); err != nil || actual != target {
 		t.Fatalf("symlink changed: %s %v", actual, err)
+	}
+}
+
+func TestInstallPreservesSuspendedSchedules(t *testing.T) {
+	home := t.TempDir()
+	db := filepath.Join(home, "cronex", "crons.sqlite3")
+	s, err := cronex.Open(db, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+	if err := s.EnsureSession(ctx, "session", true); err != nil {
+		t.Fatal(err)
+	}
+	j, err := s.Create(ctx, "session", cronex.CreateInput{Prompt: "keep scheduled", EverySeconds: 600}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.EndSession(ctx, "session"); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if err := install(home, db, "codex", &out); err != nil {
+		t.Fatal(err)
+	}
+	jobs, err := s.List(ctx, "session", time.Now())
+	if err != nil || len(jobs) != 1 || jobs[0].ID != j.ID || !jobs[0].NextRunAt.Equal(j.NextRunAt) {
+		t.Fatalf("install changed schedule: %+v %v", jobs, err)
+	}
+	if generation, err := s.StartWatch(ctx, "session"); err != nil || generation != "" {
+		t.Fatalf("install reactivated closed session: %q %v", generation, err)
 	}
 }

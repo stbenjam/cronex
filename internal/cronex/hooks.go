@@ -9,6 +9,8 @@ import (
 	"os/exec"
 	"strings"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 type HookInput struct {
@@ -16,6 +18,23 @@ type HookInput struct {
 	Event     string `json:"hook_event_name"`
 	TurnID    string `json:"turn_id"`
 	AgentID   string `json:"agent_id"`
+	Prompt    string `json:"prompt"`
+}
+
+const deliveryPrefix = "Cronex delivery: "
+
+// Only the leading delivery marker acknowledges a batch, never text embedded
+// in the scheduled task or an unrelated user message.
+func (in HookInput) DeliveryToken() string {
+	line, _, _ := strings.Cut(in.Prompt, "\n")
+	if !strings.HasPrefix(line, deliveryPrefix) {
+		return ""
+	}
+	token := strings.TrimPrefix(line, deliveryPrefix)
+	if _, err := uuid.Parse(token); err != nil {
+		return ""
+	}
+	return token
 }
 
 // Subagent tool hooks carry the parent's session_id and the child's agent_id.
@@ -132,7 +151,7 @@ func Watch(ctx context.Context, s *Store, session string, queue QueueFunc, poll 
 					}
 					continue
 				}
-				deliveryErr := queue(ctx, session, Prompt(d.Jobs))
+				deliveryErr := queue(ctx, session, deliveryPrefix+d.Token+"\n"+Prompt(d.Jobs))
 				if err := s.Complete(ctx, d, deliveryErr == nil, time.Now()); err != nil {
 					return err
 				}

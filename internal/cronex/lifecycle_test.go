@@ -131,6 +131,131 @@ func TestSuspensionKeepsInFlightLease(t *testing.T) {
 	}
 }
 
+func TestPendingQueueSurvivesResumeWithoutAnotherCatchUp(t *testing.T) {
+	s, path := testStore(t)
+	j := create(t, s, "A", CreateInput{Prompt: "queued", EverySeconds: 60})
+	generation, err := s.StartWatch(ctx, "A")
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, err := s.Claim(ctx, "A", generation, epoch.Add(time.Minute))
+	if err != nil || len(d.Jobs) != 1 {
+		t.Fatalf("claim: %+v %v", d, err)
+	}
+	if err := s.Complete(ctx, d, true, epoch.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.EndSession(ctx, "A"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s, err = Open(path, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err := s.EnsureSession(ctx, "A", true); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.BeginTurn(ctx, "A", "resume"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.FinishTurn(ctx, "A", "resume"); err != nil {
+		t.Fatal(err)
+	}
+	generation, err = s.StartWatch(ctx, "A")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := epoch.Add(48 * time.Hour)
+	if err := s.AcknowledgeQueue(ctx, "B", d.Token, now); err != nil {
+		t.Fatal(err)
+	}
+	if due, err := s.Due(ctx, "A", now); err != nil || due {
+		t.Fatalf("already queued job was due: %v %v", due, err)
+	}
+	var out bytes.Buffer
+	if err := Probe(ctx, s, "A", &out, now); err != nil || out.Len() != 0 {
+		t.Fatalf("probe duplicated queued prompt: %s %v", out.String(), err)
+	}
+	if next, err := s.Claim(ctx, "A", generation, now); err != nil || len(next.Jobs) != 0 {
+		t.Fatalf("watcher duplicated queued prompt: %+v %v", next, err)
+	}
+	if err := s.AcknowledgeQueue(ctx, "A", d.Token, now); err != nil {
+		t.Fatal(err)
+	}
+	jobs, err := s.List(ctx, "A", now)
+	if err != nil || len(jobs) != 1 || jobs[0].ID != j.ID || !jobs[0].NextRunAt.Equal(now.Add(time.Minute)) {
+		t.Fatalf("queued prompt did not cover missed ticks: %+v %v", jobs, err)
+	}
+	if due, err := s.Due(ctx, "A", now); err != nil || due {
+		t.Fatalf("catch-up repeated after queue consumption: %v %v", due, err)
+	}
+	if due, err := s.Due(ctx, "A", now.Add(time.Minute)); err != nil || !due {
+		t.Fatalf("future recurrence lost: %v %v", due, err)
+	}
+	// A duplicate acknowledgement must not skip a later legitimate recurrence.
+	if err := s.AcknowledgeQueue(ctx, "A", d.Token, now.Add(2*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if due, err := s.Due(ctx, "A", now.Add(2*time.Minute)); err != nil || !due {
+		t.Fatalf("stale acknowledgement changed recurrence: %v %v", due, err)
+	}
+}
+
+func TestQueueAcknowledgementBeforeAcceptanceIsRecorded(t *testing.T) {
+	s, _ := testStore(t)
+	create(t, s, "A", CreateInput{Prompt: "fast consumer", EverySeconds: 60})
+	generation, err := s.StartWatch(ctx, "A")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := epoch.Add(time.Minute)
+	d, err := s.Claim(ctx, "A", generation, now)
+	if err != nil || len(d.Jobs) != 1 {
+		t.Fatalf("claim: %+v %v", d, err)
+	}
+	if err := s.AcknowledgeQueue(ctx, "A", d.Token, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Complete(ctx, d, true, now); err != nil {
+		t.Fatal(err)
+	}
+	if due, err := s.Due(ctx, "A", now.Add(time.Minute)); err != nil || !due {
+		t.Fatalf("fast acknowledgement left job pending forever: %v %v", due, err)
+	}
+}
+
+func TestUnconfirmedQueueRecoversAfterCrash(t *testing.T) {
+	s, _ := testStore(t)
+	create(t, s, "A", CreateInput{Prompt: "crashed before queue", EverySeconds: 1})
+	generation, err := s.StartWatch(ctx, "A")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := epoch.Add(time.Second)
+	d, err := s.Claim(ctx, "A", generation, now)
+	if err != nil || len(d.Jobs) != 1 {
+		t.Fatalf("claim: %+v %v", d, err)
+	}
+	// No Complete: the process died. An unconfirmed queue intent must not stick.
+	retry, err := s.Claim(ctx, "A", generation, now.Add(leaseTime))
+	if err != nil || len(retry.Jobs) != 1 || retry.Token == d.Token {
+		t.Fatalf("abandoned queue intent did not recover: %+v %v", retry, err)
+	}
+	if err := s.Complete(ctx, d, true, now.Add(leaseTime)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Complete(ctx, retry, false, now.Add(leaseTime)); err != nil {
+		t.Fatal(err)
+	}
+	if due, err := s.Due(ctx, "A", now.Add(leaseTime)); err != nil || !due {
+		t.Fatalf("old completion or failed queue blocked retry: %v %v", due, err)
+	}
+}
+
 func TestDelayedStopCannotEnableIdleDelivery(t *testing.T) {
 	s, _ := testStore(t)
 	create(t, s, "A", CreateInput{Prompt: "scheduled", EverySeconds: 1})

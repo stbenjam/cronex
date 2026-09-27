@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/pelletier/go-toml/v2"
+	"github.com/stbenjam/cronex/internal/cronex"
 	"golang.org/x/sys/unix"
 )
 
@@ -129,6 +130,15 @@ func install(home, db, codex string, out io.Writer) error {
 		return err
 	}
 	if err := os.MkdirAll(filepath.Dir(destination), 0700); err != nil {
+		return err
+	}
+	// Upgrade persistent state before replacing the executable: already-running
+	// Codex sessions can invoke the new hook binary immediately after the rename.
+	store, err := cronex.Open(db, true)
+	if err != nil {
+		return fmt.Errorf("initialize cron database: %w", err)
+	}
+	if err := store.Close(); err != nil {
 		return err
 	}
 	if err := atomicWrite(destination, binary, 0700); err != nil {

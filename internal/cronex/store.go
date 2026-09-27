@@ -56,7 +56,11 @@ CREATE TABLE IF NOT EXISTS jobs (
  body TEXT NOT NULL, next_ms INTEGER NOT NULL, expires_ms INTEGER,
  lease TEXT NOT NULL DEFAULT '', lease_until_ms INTEGER NOT NULL DEFAULT 0
 );
-CREATE INDEX IF NOT EXISTS jobs_due ON jobs(session_id, next_ms);`)
+CREATE INDEX IF NOT EXISTS jobs_due ON jobs(session_id, next_ms);
+CREATE TABLE IF NOT EXISTS queued_deliveries (
+ job_id TEXT PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
+ token TEXT NOT NULL, accepted INTEGER NOT NULL DEFAULT 0
+);`)
 		if err != nil {
 			_ = db.Close()
 			return nil, err
@@ -192,6 +196,71 @@ func (s *Store) BeginTurn(ctx context.Context, session, turn string) error {
 	return err
 }
 
+// AcknowledgeQueue is called when Codex starts the queued prompt. The token is
+// recorded before queueing, so acknowledgement may safely race Complete.
+func (s *Store) AcknowledgeQueue(ctx context.Context, session, token string, now time.Time) error {
+	if token == "" {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	rows, err := tx.QueryContext(ctx, `SELECT body FROM jobs
+WHERE session_id=? AND EXISTS(SELECT 1 FROM sessions WHERE id=? AND ended=0)
+AND EXISTS(SELECT 1 FROM queued_deliveries WHERE job_id=jobs.id AND token=?)`, session, session, token)
+	if err != nil {
+		return err
+	}
+	var jobs []Job
+	for rows.Next() {
+		var body string
+		var j Job
+		if err = rows.Scan(&body); err == nil {
+			err = json.Unmarshal([]byte(body), &j)
+		}
+		if err != nil {
+			break
+		}
+		jobs = append(jobs, j)
+	}
+	rowErr := rows.Err()
+	_ = rows.Close()
+	if err != nil {
+		return err
+	}
+	if rowErr != nil {
+		return rowErr
+	}
+	for _, j := range jobs {
+		// This queued prompt also covers ticks missed while it was waiting.
+		// Keep the lease: Complete may still be recording the queue acceptance.
+		if j.Recurring && !j.NextRunAt.After(now) {
+			j.NextRunAt, err = j.Next(now)
+			if err != nil {
+				return err
+			}
+			if j.ExpiresAt != nil && !j.NextRunAt.Before(*j.ExpiresAt) {
+				_, err = tx.ExecContext(ctx, `DELETE FROM jobs WHERE id=?`, j.ID)
+			} else {
+				var body []byte
+				body, err = json.Marshal(j)
+				if err == nil {
+					_, err = tx.ExecContext(ctx, `UPDATE jobs SET body=?,next_ms=? WHERE id=?`, string(body), j.NextRunAt.UnixMilli(), j.ID)
+				}
+			}
+			if err != nil {
+				return err
+			}
+		}
+		if _, err = tx.ExecContext(ctx, `DELETE FROM queued_deliveries WHERE job_id=? AND token=?`, j.ID, token); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 // FinishTurn ignores delayed Stop/Interrupt events belonging to older turns.
 func (s *Store) FinishTurn(ctx context.Context, session, turn string) error {
 	if turn == "" {
@@ -204,7 +273,8 @@ func (s *Store) FinishTurn(ctx context.Context, session, turn string) error {
 // Due is the entire PostToolUse fast path: an indexed read, no write locks.
 func (s *Store) Due(ctx context.Context, session string, now time.Time) (bool, error) {
 	var exists bool
-	err := s.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM jobs WHERE session_id=? AND next_ms<=? AND lease_until_ms<=? AND (expires_ms IS NULL OR expires_ms>?))`, session, now.UnixMilli(), now.UnixMilli(), now.UnixMilli()).Scan(&exists)
+	err := s.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM jobs WHERE session_id=? AND next_ms<=? AND lease_until_ms<=? AND (expires_ms IS NULL OR expires_ms>?)
+AND NOT EXISTS(SELECT 1 FROM queued_deliveries WHERE job_id=jobs.id AND accepted=1))`, session, now.UnixMilli(), now.UnixMilli(), now.UnixMilli()).Scan(&exists)
 	return exists, err
 }
 
@@ -231,7 +301,8 @@ func (s *Store) Claim(ctx context.Context, session, generation string, now time.
 	if ended || (generation != "" && (current != generation || !idle)) {
 		return d, nil
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT body FROM jobs WHERE session_id=? AND next_ms<=? AND lease_until_ms<=? AND (expires_ms IS NULL OR expires_ms>?) ORDER BY next_ms,id LIMIT 8`, session, now.UnixMilli(), now.UnixMilli(), now.UnixMilli())
+	rows, err := tx.QueryContext(ctx, `SELECT body FROM jobs WHERE session_id=? AND next_ms<=? AND lease_until_ms<=? AND (expires_ms IS NULL OR expires_ms>?)
+AND NOT EXISTS(SELECT 1 FROM queued_deliveries WHERE job_id=jobs.id AND accepted=1) ORDER BY next_ms,id LIMIT 8`, session, now.UnixMilli(), now.UnixMilli(), now.UnixMilli())
 	if err != nil {
 		return d, err
 	}
@@ -258,6 +329,14 @@ func (s *Store) Claim(ctx context.Context, session, generation string, now time.
 		if _, err = tx.ExecContext(ctx, `UPDATE jobs SET lease=?,lease_until_ms=? WHERE id=? AND session_id=?`, d.Token, now.Add(leaseTime).UnixMilli(), j.ID, session); err != nil {
 			return d, err
 		}
+		if generation != "" {
+			_, err = tx.ExecContext(ctx, `INSERT INTO queued_deliveries(job_id,token) VALUES (?,?) ON CONFLICT(job_id) DO UPDATE SET token=excluded.token,accepted=0`, j.ID, d.Token)
+		} else {
+			_, err = tx.ExecContext(ctx, `DELETE FROM queued_deliveries WHERE job_id=?`, j.ID)
+		}
+		if err != nil {
+			return d, err
+		}
 	}
 	return d, tx.Commit()
 }
@@ -270,8 +349,14 @@ func (s *Store) Complete(ctx context.Context, d Delivery, delivered bool, now ti
 	defer tx.Rollback()
 	for _, j := range d.Jobs {
 		if !delivered {
+			if _, err = tx.ExecContext(ctx, `DELETE FROM queued_deliveries WHERE job_id=? AND token=?`, j.ID, d.Token); err != nil {
+				return err
+			}
 			_, err = tx.ExecContext(ctx, `UPDATE jobs SET lease='',lease_until_ms=0 WHERE id=? AND session_id=? AND lease=?`, j.ID, j.SessionID, d.Token)
 		} else {
+			if _, err = tx.ExecContext(ctx, `UPDATE queued_deliveries SET accepted=1 WHERE job_id=? AND token=? AND EXISTS(SELECT 1 FROM jobs WHERE id=? AND lease=?)`, j.ID, d.Token, j.ID, d.Token); err != nil {
+				return err
+			}
 			next, nextErr := j.Next(now)
 			if nextErr != nil {
 				return nextErr
@@ -318,6 +403,7 @@ func (s *Store) WatchState(ctx context.Context, session, generation string, now 
 	var next sql.NullInt64
 	err := s.db.QueryRowContext(ctx, `SELECT ended=0 AND generation=?,
  (SELECT MIN(MAX(next_ms,lease_until_ms)) FROM jobs WHERE session_id=? AND (expires_ms IS NULL OR expires_ms>?)
+ AND NOT EXISTS(SELECT 1 FROM queued_deliveries WHERE job_id=jobs.id AND accepted=1)
  AND EXISTS(SELECT 1 FROM session_state WHERE session_id=jobs.session_id AND idle=1))
  FROM sessions WHERE id=?`, generation, session, now.UnixMilli(), session).Scan(&active, &next)
 	if errors.Is(err, sql.ErrNoRows) {
