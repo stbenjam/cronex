@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -95,6 +96,11 @@ func trustInstalledHooks(ctx context.Context, home, db, queueBinary, codex strin
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, codex, "app-server", "--stdio")
+	// The npm launcher spawns a native child which inherits its streams. Own
+	// the whole process group so neither success nor cancellation leaves that
+	// child holding a pipe open after the launcher exits.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.WaitDelay = time.Second
 	cmd.Dir = home // Avoid loading an unrelated repository's project config.
 	for _, variable := range os.Environ() {
 		if !strings.HasPrefix(variable, "CODEX_HOME=") {
@@ -112,10 +118,26 @@ func trustInstalledHooks(ctx context.Context, home, db, queueBinary, codex strin
 	if err != nil {
 		return err
 	}
+	killGroup := func() error {
+		err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		if err == syscall.ESRCH {
+			return os.ErrProcessDone
+		}
+		return err
+	}
+	cmd.Cancel = func() error {
+		// Unblock a synchronous RPC read even if a descendant has detached.
+		_ = output.Close()
+		return killGroup()
+	}
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start Codex hook discovery: %w", err)
 	}
-	defer func() { _ = cmd.Process.Kill(); _ = cmd.Wait() }()
+	defer func() {
+		_ = input.Close()
+		_ = killGroup()
+		_ = cmd.Wait()
+	}()
 	encoder, decoder := json.NewEncoder(input), json.NewDecoder(output)
 	id := 0
 	rpc := func(method string, params, result any) error {

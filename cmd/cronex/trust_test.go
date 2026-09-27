@@ -1,11 +1,48 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 )
+
+// Like the npm Codex launcher, this fixture has a child that inherits its
+// streams. Killing just the launcher used to leave install stuck in Wait.
+func TestHookDiscoveryReapsLauncherChildren(t *testing.T) {
+	for _, response := range []string{"rpc-error", "timeout"} {
+		t.Run(response, func(t *testing.T) {
+			home := t.TempDir()
+			if err := os.WriteFile(filepath.Join(home, "config.toml"), nil, 0600); err != nil {
+				t.Fatal(err)
+			}
+			script := "#!/bin/sh\nsleep 60 &\n"
+			if response == "rpc-error" {
+				script += "printf '%s\\n' '{\"id\":1,\"error\":{\"message\":\"fixture failure\"}}'\n"
+			}
+			script += "wait\n"
+			launcher := filepath.Join(home, "codex")
+			if err := os.WriteFile(launcher, []byte(script), 0700); err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+			defer cancel()
+			start := time.Now()
+			err := trustInstalledHooks(ctx, home, filepath.Join(home, "jobs.sqlite3"), "codex", launcher, io.Discard)
+			if err == nil || (response == "rpc-error" && !strings.Contains(err.Error(), "fixture failure")) ||
+				(response == "timeout" && !strings.Contains(err.Error(), "deadline exceeded")) {
+				t.Fatalf("unexpected discovery error: %v", err)
+			}
+			if elapsed := time.Since(start); elapsed > 3*time.Second {
+				t.Fatalf("launcher cleanup took %s", elapsed)
+			}
+		})
+	}
+}
 
 func TestInstalledHookSelection(t *testing.T) {
 	config := filepath.Join(t.TempDir(), "config.toml")
