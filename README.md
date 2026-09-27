@@ -180,6 +180,46 @@ the PR once and reconcile the jobs before returning to idle.
    the queued prompt, its `UserPromptSubmit` hook acknowledges the delivery and
    advances the schedule past any ticks missed while waiting.
 
+### Optional keepalive
+
+Keepalive is **off by default**. To enable it for one Codex home, create
+`$CODEX_HOME/cronex/config.toml` (normally `~/.codex/cronex/config.toml`):
+
+```toml
+keepAlive = "27m"
+```
+
+This is Cronex's own settings file, separate from Codex's `config.toml`.
+Each idle session with an unexpired cron receives a keepalive after that interval
+without a turn starting or finishing. The prompt tells the model to perform no
+action and end the turn with a brief acknowledgement. Real cron work takes
+priority; keepalives do not change its deadlines. Active turns need no keepalive.
+Deleting or expiring the last cron stops new keepalives for that session.
+
+Durations use units such as `s`, `m`, or `h`; the minimum enabled interval is
+`1s`. Omit the setting, use an empty string, or set `keepAlive = "0"` to disable
+it. Invalid settings log an error and disable keepalive while ordinary cron
+delivery continues. Settings are read when an async watcher starts; send a
+message in each running session after changing them. `make install` preserves
+this file. Each `CODEX_HOME` has independent settings.
+
+This can prevent idle session reaping by a host such as T3 Code. Choose an
+interval below the host's idle limit with room for queue and model latency.
+T3's [idle reaper](https://github.com/pingdotgg/t3code/blob/94f92a7a386a26c98892b24fabdd0ea9fa804ce3/apps/server/src/provider/Layers/ProviderSessionReaper.ts)
+currently uses a 30-minute limit, so `27m` leaves a three-minute margin. A
+keepalive starts a model turn and consumes tokens even though it requests no
+work. It is a best-effort workaround, not protection from a host restart,
+process crash, or machine suspension.
+
+At most one keepalive can remain pending per session. A pending recurring-cron
+delivery also suppresses keepalives while its cron remains unexpired. If Codex
+has paused its queue after an interrupt,
+the queued message cannot reset the host's idle timer until it actually runs;
+resume queued work to restore keepalive protection. Disabling keepalive or
+deleting a cron cannot recall a message already queued. Avoid manually removing
+pending keepalives: Codex does not notify Cronex, so the pending marker would
+continue suppressing them.
+
 Practical limits:
 
 - Requires a running Codex host/daemon able to accept `codex queue`. Async

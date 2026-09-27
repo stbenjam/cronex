@@ -100,7 +100,7 @@ func TestWatcherQueuesOwningSessionAndRetriesFailure(t *testing.T) {
 	}
 	deadline, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
-	if err := Watch(deadline, s, "A", queue, time.Millisecond, io.Discard); err != nil {
+	if err := Watch(deadline, s, "A", queue, time.Millisecond, 0, io.Discard); err != nil {
 		t.Fatal(err)
 	}
 	if calls != 2 {
@@ -127,7 +127,7 @@ func TestWatcherCleanupAndCancellation(t *testing.T) {
 			defer cancel()
 			done := make(chan error, 1)
 			go func() {
-				done <- Watch(deadline, s, "A", func(context.Context, string, string) error { calls.Add(1); return nil }, time.Millisecond, io.Discard)
+				done <- Watch(deadline, s, "A", func(context.Context, string, string) error { calls.Add(1); return nil }, time.Millisecond, 0, io.Discard)
 			}()
 			// Wait for the watcher to register before changing its state.
 			for {

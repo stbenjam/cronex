@@ -60,6 +60,11 @@ CREATE INDEX IF NOT EXISTS jobs_due ON jobs(session_id, next_ms);
 CREATE TABLE IF NOT EXISTS queued_deliveries (
  job_id TEXT PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
  token TEXT NOT NULL, accepted INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS session_keepalive (
+ session_id TEXT PRIMARY KEY REFERENCES sessions(id), activity_ms INTEGER NOT NULL,
+ token TEXT NOT NULL DEFAULT '', accepted INTEGER NOT NULL DEFAULT 0,
+ lease_until_ms INTEGER NOT NULL DEFAULT 0
 );`)
 		if err != nil {
 			_ = db.Close()
@@ -89,6 +94,9 @@ func (s *Store) EnsureSession(ctx context.Context, id string, restart bool) erro
 		return err
 	}
 	if _, err = tx.ExecContext(ctx, `INSERT INTO session_state(session_id) SELECT id FROM sessions WHERE id=? AND ended=0 ON CONFLICT DO NOTHING`, id); err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `INSERT INTO session_keepalive(session_id,activity_ms) SELECT id,? FROM sessions WHERE id=? AND ended=0 ON CONFLICT DO NOTHING`, time.Now().UnixMilli(), id); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -192,8 +200,7 @@ func (s *Store) BeginTurn(ctx context.Context, session, turn string) error {
 	if turn == "" {
 		return errors.New("hook is missing turn_id")
 	}
-	_, err := s.db.ExecContext(ctx, `UPDATE session_state SET turn_id=?,idle=0 WHERE session_id=?`, turn, session)
-	return err
+	return s.setTurnState(ctx, session, turn, false)
 }
 
 // AcknowledgeQueue is called when Codex starts the queued prompt. The token is
@@ -207,6 +214,10 @@ func (s *Store) AcknowledgeQueue(ctx context.Context, session, token string, now
 		return err
 	}
 	defer tx.Rollback()
+	if _, err = tx.ExecContext(ctx, `UPDATE session_keepalive SET token='',accepted=0,lease_until_ms=0
+WHERE session_id=? AND token=? AND EXISTS(SELECT 1 FROM sessions WHERE id=? AND ended=0)`, session, token, session); err != nil {
+		return err
+	}
 	rows, err := tx.QueryContext(ctx, `SELECT body FROM jobs
 WHERE session_id=? AND EXISTS(SELECT 1 FROM sessions WHERE id=? AND ended=0)
 AND EXISTS(SELECT 1 FROM queued_deliveries WHERE job_id=jobs.id AND token=?)`, session, session, token)
@@ -266,8 +277,7 @@ func (s *Store) FinishTurn(ctx context.Context, session, turn string) error {
 	if turn == "" {
 		return errors.New("hook is missing turn_id")
 	}
-	_, err := s.db.ExecContext(ctx, `UPDATE session_state SET idle=1 WHERE session_id=? AND turn_id=?`, session, turn)
-	return err
+	return s.setTurnState(ctx, session, turn, true)
 }
 
 // Due is the entire PostToolUse fast path: an indexed read, no write locks.

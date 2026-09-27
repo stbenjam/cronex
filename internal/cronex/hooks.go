@@ -124,7 +124,7 @@ func CodexQueue(binary string) QueueFunc {
 // queue explicitly addresses the owning thread instead. No model tokens are
 // used while waiting. Active turns pause delivery, while retaining a watcher
 // for Interrupt. A generation limits overlapping hooks to one surviving watcher.
-func Watch(ctx context.Context, s *Store, session string, queue QueueFunc, poll time.Duration, log io.Writer) error {
+func Watch(ctx context.Context, s *Store, session string, queue QueueFunc, poll, keepAlive time.Duration, log io.Writer) error {
 	generation, err := s.StartWatch(ctx, session)
 	if err != nil || generation == "" {
 		return err
@@ -135,6 +135,15 @@ func Watch(ctx context.Context, s *Store, session string, queue QueueFunc, poll 
 		active, wait, err := s.WatchState(ctx, session, generation, now)
 		if err != nil || !active {
 			return err
+		}
+		if keepAlive > 0 {
+			until, eligible, err := s.KeepAliveWait(ctx, session, generation, keepAlive, now)
+			if err != nil {
+				return err
+			}
+			if eligible {
+				wait = min(wait, until)
+			}
 		}
 		if wait <= 0 {
 			d, err := s.Claim(ctx, session, generation, now)
@@ -161,6 +170,31 @@ func Watch(ctx context.Context, s *Store, session string, queue QueueFunc, poll 
 				fmt.Fprintln(log, "cronex:", deliveryErr)
 				wait = backoff
 				backoff = min(backoff*2, 30*time.Second)
+			} else if keepAlive > 0 {
+				token, err := s.ClaimKeepAlive(ctx, session, generation, keepAlive, now)
+				if err != nil {
+					return err
+				}
+				if token != "" {
+					active, err = s.CanDeliver(ctx, session, generation)
+					if err != nil || !active {
+						_ = s.CompleteKeepAlive(ctx, session, token, false)
+						if err != nil {
+							return err
+						}
+						continue
+					}
+					deliveryErr := queue(ctx, session, deliveryPrefix+token+"\n"+keepAlivePrompt)
+					if err := s.CompleteKeepAlive(ctx, session, token, deliveryErr == nil); err != nil {
+						return err
+					}
+					if deliveryErr == nil {
+						return nil
+					}
+					fmt.Fprintln(log, "cronex:", deliveryErr)
+					wait = backoff
+					backoff = min(backoff*2, 30*time.Second)
+				}
 			}
 		} else {
 			wait = min(wait, poll)

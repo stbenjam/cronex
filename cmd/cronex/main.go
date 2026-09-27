@@ -106,7 +106,13 @@ func run(ctx context.Context, args []string, in io.Reader, out, log io.Writer) e
 	}
 	defer s.Close()
 	if *watch {
-		return cronex.Watch(ctx, s, payload.SessionID, cronex.CodexQueue(*binary), time.Second, log)
+		keepAlive, err := readKeepAlive(filepath.Join(*home, "cronex", "config.toml"))
+		if err != nil {
+			// Invalid optional settings must not disable ordinary cron delivery.
+			fmt.Fprintln(log, "cronex: keepalive disabled:", err)
+			keepAlive = 0
+		}
+		return cronex.Watch(ctx, s, payload.SessionID, cronex.CodexQueue(*binary), time.Second, keepAlive, log)
 	}
 	switch payload.Event {
 	case "SessionStart":

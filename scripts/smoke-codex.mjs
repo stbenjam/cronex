@@ -283,7 +283,40 @@ try {
   assert.equal(requests.filter(r => isWake(r, restartMarker)).length, 1, 'one recurring delivery, not 482');
   assert.equal(requests.filter(r => isWake(r, onceMarker)).length, 1, 'one one-shot delivery');
   assert.ok(state().sessions.some(s => s.id === a && s.ended === 1), 'resuming B did not reactivate A');
-  console.log('PASS: automatic scoped hook trust, idempotent reinstall, real Codex session routing, idle wakeup, active-turn handoff, recurring delivery, interruption recovery, complete batches, shutdown persistence, pending-queue deduplication, and coalesced delivery after restart.');
+
+  const keepAliveMarker = 'Cronex keepalive only.';
+  const keepAliveRequests = () => requests.filter(r => isWake(r, keepAliveMarker));
+  assert.equal(keepAliveRequests().length, 0, 'keepalive defaults off');
+  writeFileSync(join(root, 'cronex', 'config.toml'), 'keepAlive = "1s"\n', { mode: 0o600 });
+  const keepAliveThread = (await rpc('thread/start', { cwd: workspace })).thread.id;
+  await warm(keepAliveThread);
+  await sleep(1300);
+  assert.equal(keepAliveRequests().length, 0, 'empty session does not receive keepalives');
+  const longJob = await call(keepAliveThread, 'CronCreate', { prompt: 'CRONEX_LONG_BACKOFF', every_seconds: 28800 });
+  await until(() => keepAliveRequests().length >= 2, 'repeated keepalive-only turns', 15000);
+  assert.ok(!requests.some(r => contains(r, 'CRONEX_LONG_BACKOFF')), 'keepalive did not execute the future task');
+  assert.ok(keepAliveRequests().every(r => JSON.stringify(r.input.filter(i => i.role === 'user').at(-1)).includes('Perform no action')), 'keepalive directs no work');
+  assert.equal((await call(keepAliveThread, 'CronList')).jobs.find(j => j.id === longJob.id).next_run_at, longJob.next_run_at, 'keepalive preserved the real deadline');
+  await call(keepAliveThread, 'CronDelete', { id: longJob.id });
+  const afterDelete = keepAliveRequests().length;
+  await sleep(2200);
+  assert.equal(keepAliveRequests().length, afterDelete, 'deleting the last cron stops keepalives');
+
+  // A paused host cannot be kept alive by queue acceptance alone. Preserve one
+  // pending keepalive across watcher replacement without building a backlog.
+  const keepAliveHeld = await rpc('turn/start', { threadId: keepAliveThread, input: [{ type: 'text', text: 'CRONEX_HOLD_MODEL_KEEPALIVE' }] });
+  await until(() => requests.some(r => contains(r, 'CRONEX_HOLD_MODEL_KEEPALIVE')), 'keepalive active turn');
+  await call(keepAliveThread, 'CronCreate', { prompt: 'CRONEX_PAUSED_LONG_BACKOFF', every_seconds: 28800 });
+  await sleep(1300);
+  const queuedKeepAlives = async () => (await rpc('thread/queue/list', { threadId: keepAliveThread })).data.filter(q => JSON.stringify(q.input).includes(keepAliveMarker)).length;
+  assert.equal(await queuedKeepAlives(), 0, 'active turn needs no keepalive');
+  await rpc('turn/interrupt', { threadId: keepAliveThread, turnId: keepAliveHeld.turn.id });
+  await until(() => completed(keepAliveHeld), 'keepalive turn interrupted');
+  await until(async () => (await queuedKeepAlives()) === 1, 'keepalive queued after interrupt');
+  await sleep(2200);
+  assert.equal(await queuedKeepAlives(), 1, 'at most one pending keepalive');
+  await rpc('thread/archive', { threadId: keepAliveThread });
+  console.log('PASS: automatic scoped hook trust, idempotent reinstall, real Codex session routing, idle wakeup, active-turn handoff, recurring delivery, interruption recovery, complete batches, shutdown persistence, pending-queue deduplication, coalesced delivery after restart, and opt-in keepalive with no backlog.');
 } catch (error) {
   console.error(error);
   console.error('Codex stderr:', stderr.slice(-6000));
