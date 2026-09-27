@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -34,10 +35,25 @@ func TestRootLifecycleAndSubagentExclusion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	oneShot := false
+	if _, err := s.Create(ctx, "parent", cronex.CreateInput{Prompt: "root scheduled task", EverySeconds: 1, Recurring: &oneShot}, time.Now().Add(-2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
 	for _, event := range []string{"SessionStart", "UserPromptSubmit", "PostToolUse", "Stop", "SessionEnd"} {
 		if out := hook(event, "child", "child-turn"); out != "" {
 			t.Fatalf("child hook output: %s", out)
 		}
+	}
+	jobs, err := s.List(ctx, "parent", time.Now())
+	if err != nil || len(jobs) != 1 {
+		t.Fatalf("child hook changed scheduled work: %+v %v", jobs, err)
+	}
+	if out := hook("PostToolUse", "", "current"); !strings.Contains(out, "root scheduled task") {
+		t.Fatalf("root did not receive scheduled work: %s", out)
+	}
+	jobs, err = s.List(ctx, "parent", time.Now())
+	if err != nil || len(jobs) != 0 {
+		t.Fatalf("root delivery did not acknowledge job: %+v %v", jobs, err)
 	}
 	if ready, err := s.CanDeliver(ctx, "parent", gen); err != nil || ready {
 		t.Fatalf("child changed parent lifecycle: %v %v", ready, err)
