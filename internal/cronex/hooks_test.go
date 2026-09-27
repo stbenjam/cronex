@@ -14,6 +14,18 @@ import (
 	"time"
 )
 
+func TestDeliveryTokenOnlyAcknowledgesLeadingMarker(t *testing.T) {
+	const token = "63e6f670-b602-428c-919c-9f52b728f42a"
+	for _, prompt := range []string{"", "ordinary user message", deliveryPrefix + "invalid", "quoted message\n" + deliveryPrefix + token} {
+		if got := (HookInput{Prompt: prompt}).DeliveryToken(); got != "" {
+			t.Fatalf("unrelated prompt acknowledged %q", got)
+		}
+	}
+	if got := (HookInput{Prompt: deliveryPrefix + token + "\nscheduled task"}).DeliveryToken(); got != token {
+		t.Fatalf("valid delivery was not acknowledged: %q", got)
+	}
+}
+
 func TestProbePreservesResultAndIsSilentWithoutDueJobs(t *testing.T) {
 	s, _ := testStore(t)
 	create(t, s, "A", CreateInput{Prompt: "check PR", EverySeconds: 600})

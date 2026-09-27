@@ -206,25 +206,33 @@ func TestPendingQueueSurvivesResumeWithoutAnotherCatchUp(t *testing.T) {
 }
 
 func TestQueueAcknowledgementBeforeAcceptanceIsRecorded(t *testing.T) {
-	s, _ := testStore(t)
-	create(t, s, "A", CreateInput{Prompt: "fast consumer", EverySeconds: 60})
-	generation, err := s.StartWatch(ctx, "A")
-	if err != nil {
-		t.Fatal(err)
-	}
-	now := epoch.Add(time.Minute)
-	d, err := s.Claim(ctx, "A", generation, now)
-	if err != nil || len(d.Jobs) != 1 {
-		t.Fatalf("claim: %+v %v", d, err)
-	}
-	if err := s.AcknowledgeQueue(ctx, "A", d.Token, now); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.Complete(ctx, d, true, now); err != nil {
-		t.Fatal(err)
-	}
-	if due, err := s.Due(ctx, "A", now.Add(time.Minute)); err != nil || !due {
-		t.Fatalf("fast acknowledgement left job pending forever: %v %v", due, err)
+	for _, acknowledgementDelay := range []time.Duration{0, 2 * time.Minute} {
+		t.Run(acknowledgementDelay.String(), func(t *testing.T) {
+			s, _ := testStore(t)
+			create(t, s, "A", CreateInput{Prompt: "fast consumer", EverySeconds: 60})
+			generation, err := s.StartWatch(ctx, "A")
+			if err != nil {
+				t.Fatal(err)
+			}
+			now := epoch.Add(time.Minute)
+			d, err := s.Claim(ctx, "A", generation, now)
+			if err != nil || len(d.Jobs) != 1 {
+				t.Fatalf("claim: %+v %v", d, err)
+			}
+			acknowledgedAt := now.Add(acknowledgementDelay)
+			if err := s.AcknowledgeQueue(ctx, "A", d.Token, acknowledgedAt); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.Complete(ctx, d, true, now); err != nil {
+				t.Fatal(err)
+			}
+			if due, err := s.Due(ctx, "A", acknowledgedAt); err != nil || due {
+				t.Fatalf("late completion moved acknowledged deadline backward: %v %v", due, err)
+			}
+			if due, err := s.Due(ctx, "A", acknowledgedAt.Add(time.Minute)); err != nil || !due {
+				t.Fatalf("fast acknowledgement left job pending forever: %v %v", due, err)
+			}
+		})
 	}
 }
 

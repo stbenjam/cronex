@@ -354,12 +354,28 @@ func (s *Store) Complete(ctx context.Context, d Delivery, delivered bool, now ti
 			}
 			_, err = tx.ExecContext(ctx, `UPDATE jobs SET lease='',lease_until_ms=0 WHERE id=? AND session_id=? AND lease=?`, j.ID, j.SessionID, d.Token)
 		} else {
+			// A fast queue consumer may already have advanced this job while
+			// Complete was waiting for the transaction. Keep that later deadline.
+			var current string
+			err = tx.QueryRowContext(ctx, `SELECT body FROM jobs WHERE id=? AND session_id=? AND lease=?`, j.ID, j.SessionID, d.Token).Scan(&current)
+			if errors.Is(err, sql.ErrNoRows) {
+				continue
+			}
+			if err != nil {
+				return err
+			}
+			if err := json.Unmarshal([]byte(current), &j); err != nil {
+				return err
+			}
 			if _, err = tx.ExecContext(ctx, `UPDATE queued_deliveries SET accepted=1 WHERE job_id=? AND token=? AND EXISTS(SELECT 1 FROM jobs WHERE id=? AND lease=?)`, j.ID, d.Token, j.ID, d.Token); err != nil {
 				return err
 			}
 			next, nextErr := j.Next(now)
 			if nextErr != nil {
 				return nextErr
+			}
+			if j.Recurring && j.NextRunAt.After(now) {
+				next = j.NextRunAt
 			}
 			if next.IsZero() || (j.ExpiresAt != nil && !next.Before(*j.ExpiresAt)) {
 				_, err = tx.ExecContext(ctx, `DELETE FROM jobs WHERE id=? AND session_id=? AND lease=?`, j.ID, j.SessionID, d.Token)

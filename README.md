@@ -202,6 +202,9 @@ Practical limits:
   isolated to that session ID and can be inspected/deleted upon resuming it.
 - Versions that deleted jobs on `SessionEnd` cannot recover those jobs through
   an upgrade. Recreate any already-lost schedules once in their original thread.
+  Before upgrading from a version without pending-delivery tracking, let any
+  already-queued Cronex prompts run first: they lack delivery tokens and cannot
+  be deduplicated by the new tracking table.
 - Hooks fail open on database errors, logging diagnostics to stderr. This
   preserves the agent's work, but a failed watcher cannot guarantee a
   wake until a later Stop or UserPromptSubmit starts its replacement. The lightweight probe retries on the next tool.
