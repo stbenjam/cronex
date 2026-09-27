@@ -100,6 +100,8 @@ func install(home, db, codex string, out io.Writer) error {
 		configPath = resolved
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
+	} else if info, statErr := os.Lstat(configPath); statErr == nil && info.Mode()&os.ModeSymlink != 0 {
+		return errors.New("config.toml is a dangling symlink; create its target before installing")
 	}
 	original, err := os.ReadFile(configPath)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -145,7 +147,7 @@ func install(home, db, codex string, out io.Writer) error {
 		}
 	}
 	fmt.Fprintln(out, "Installed", destination)
-	fmt.Fprintln(out, "Configured MCP server and SessionStart, UserPromptSubmit, Stop, PostToolUse, SessionEnd hooks in", configPath)
+	fmt.Fprintln(out, "Configured MCP server and lifecycle hooks in", configPath)
 	fmt.Fprintln(out, "Restart Codex, then review and trust the Cronex hooks with /hooks.")
 	return nil
 }

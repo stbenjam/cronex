@@ -23,6 +23,12 @@ func testStore(t testing.TB) (*Store, string) {
 		if err := s.EnsureSession(ctx, id, false); err != nil {
 			t.Fatal(err)
 		}
+		if err := s.BeginTurn(ctx, id, "initial"); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.FinishTurn(ctx, id, "initial"); err != nil {
+			t.Fatal(err)
+		}
 	}
 	return s, path
 }
@@ -206,12 +212,12 @@ func TestWatcherGenerationAndResume(t *testing.T) {
 	if !active || wait != 8*time.Hour || err != nil {
 		t.Fatalf("watch state: %v %v %v", active, wait, err)
 	}
-	if err := s.SuspendWatch(ctx, "A"); err != nil {
+	if err := s.BeginTurn(ctx, "A", "next"); err != nil {
 		t.Fatal(err)
 	}
 	active, _, err = s.WatchState(ctx, "A", current, epoch)
-	if active || err != nil {
-		t.Fatalf("active-turn handoff left watcher running: %v %v", active, err)
+	if !active || err != nil {
+		t.Fatalf("active-turn handoff killed watcher: %v %v", active, err)
 	}
 	d, err = s.Claim(ctx, "A", current, epoch.Add(8*time.Hour))
 	if err != nil || len(d.Jobs) != 0 {

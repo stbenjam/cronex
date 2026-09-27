@@ -37,7 +37,7 @@ func requestSession(req *mcp.CallToolRequest, bound string) (string, error) {
 
 func NewServer(s *Store, bound string) *mcp.Server {
 	server := mcp.NewServer(&mcp.Implementation{Name: "cronex", Version: "0.1.0"}, &mcp.ServerOptions{
-		Instructions: "Cronex schedules prompts in this Codex session only. Use CronCreate, CronList, and CronDelete for recurring or one-shot tasks. After scheduling, finish your turn normally: the async Stop hook waits and wakes this session. Do not poll or sleep to wait for crons. During active work PostToolUse delivers due prompts. Jobs survive MCP restarts and compaction, and are deleted on SessionEnd. For PR loops use a named dynamic interval plus a separate recurring 28800-second watcher; retain the original start/deadline in the prompt and delete both jobs at termination. These tools schedule work; they do not authorize actions beyond the user's instructions.",
+		Instructions: "Cronex schedules prompts in this root Codex session only. Subagent scheduling is unsupported; ask the parent agent to schedule work. Use CronCreate, CronList, and CronDelete for recurring or one-shot tasks. After scheduling, finish your turn normally: the async Stop hook waits and wakes this session. Do not poll or sleep to wait for crons. During active work PostToolUse delivers due prompts. Jobs survive MCP restarts and compaction, and are deleted on SessionEnd. For PR loops use a named dynamic interval plus a separate recurring 28800-second watcher; retain the original start/deadline in the prompt and delete both jobs at termination. These tools schedule work; they do not authorize actions beyond the user's instructions.",
 	})
 	no := false
 	mcp.AddTool(server, &mcp.Tool{Name: "CronCreate", Description: "Schedule a prompt for this session. Choose cron (five fields), every_seconds (relative interval), or at (one-shot RFC3339 time). Recurs by default except at. No automatic three-day expiry; optionally set expires_at.", Annotations: &mcp.ToolAnnotations{DestructiveHint: &no, OpenWorldHint: &no}},
@@ -46,8 +46,10 @@ func NewServer(s *Store, bound string) *mcp.Server {
 			if err != nil {
 				return nil, Job{}, err
 			}
-			if err := s.EnsureSession(ctx, session, false); err != nil {
-				return nil, Job{}, err
+			if bound != "" {
+				if err := s.EnsureSession(ctx, session, false); err != nil {
+					return nil, Job{}, err
+				}
 			}
 			j, err := s.Create(ctx, session, in, time.Now())
 			return nil, j, err

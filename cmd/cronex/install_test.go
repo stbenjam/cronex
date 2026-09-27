@@ -125,3 +125,19 @@ func TestInstallPreservesConfigSymlink(t *testing.T) {
 		t.Fatal("target not updated")
 	}
 }
+
+func TestInstallPreservesDanglingConfigSymlink(t *testing.T) {
+	home := t.TempDir()
+	path := filepath.Join(home, "config.toml")
+	target := filepath.Join(home, "missing.toml")
+	if err := os.Symlink(target, path); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if err := install(home, filepath.Join(home, "db"), "codex", &out); err == nil {
+		t.Fatal("dangling symlink accepted")
+	}
+	if actual, err := os.Readlink(path); err != nil || actual != target {
+		t.Fatalf("symlink changed: %s %v", actual, err)
+	}
+}

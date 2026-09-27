@@ -24,7 +24,8 @@ make install CODEX_HOME=/path/to/codex-home
 This builds and installs `$CODEX_HOME/cronex/bin/cronex`, then configures the
 MCP server and lifecycle hooks in `$CODEX_HOME/config.toml`. `CODEX_HOME` defaults
 to `~/.codex`. Existing settings, comments, and hooks are preserved; changed
-configurations are backed up beside the original. Repeat installs update the
+configurations are backed up beside the original. Dangling configuration symlinks are preserved with an error asking you to create
+the target first. Repeat installs update the
 managed Cronex block without duplicating hooks. An existing manually configured
 `mcp_servers.cronex` is left untouched with an error asking you to remove the
 old Cronex entries first.
@@ -54,7 +55,10 @@ The queue command must connect to the daemon that owns the session.
 
 Session ownership comes from Codex's per-call `_meta.threadId`, **not** a
 model-supplied argument, the working directory, or the MCP connection ID.
-Calls without that metadata fail with a clear error. For manual MCP clients
+Calls without that metadata fail with a clear error. `CronCreate` also requires
+registration by the root `SessionStart` hook. Subagents cannot schedule crons;
+they should ask the parent agent to schedule the work. Child hooks are excluded
+from parent delivery, and `SubagentStart` cleans up any legacy child jobs. For manual MCP clients
 only, `cronex serve --session <id>` explicitly binds a session; conflicting
 metadata is rejected. No environment variable is needed for normal Codex use.
 
@@ -87,7 +91,7 @@ Cronex never executes them as shell commands.
 
 Takes `{}`. Returns `{"jobs": [...]}` for the calling session, ordered by next
 run time. Includes each job's prompt and name so skills can find existing
-jobs, retain a watcher, and replace a dynamic interval. Expired jobs are omitted.
+jobs, retain a watcher, and replace a dynamic interval. Expired jobs are omitted and reclaimed when the session creates another job.
 
 ### CronDelete
 
@@ -130,16 +134,22 @@ the PR once and reconcile the jobs before returning to idle.
 ## Delivery and lifecycle
 
 1. `CronCreate` persists a job under the request's Codex thread ID.
-2. `Stop` starts an async watcher. It uses a timer and local database checks
-   while the model is idle. It exits if there are no jobs, the session ends,
-   or a newer watcher replaces it. Each successful wake ends that watcher;
-   the next Stop arms a new one.
+2. `Stop` and `UserPromptSubmit` each run a short synchronous lifecycle handler
+   and an async watcher. The lifecycle handler records the current turn and
+   whether it is active or idle; only the matching turn can mark itself idle.
+   Background watchers observe this state without changing it, so delayed hooks
+   cannot undo a newer turn's state. Generations retire overlapping watchers.
+   A watcher stays available even with no jobs, allowing an interrupted first
+   turn to recover after creating a cron. Each successful wake ends that watcher;
+   the new turn arms its replacement. At most one surviving watcher per session
+   checks local state once per second; no model tokens are used while waiting.
 3. `PostToolUse` does one indexed SQLite due check. When nothing is due it
    writes nothing, launches no subprocesses, sleeps nowhere, and emits no
    output. Due jobs use `hookSpecificOutput.additionalContext`, preserving
    the original tool result, including in Codex code mode.
-   `UserPromptSubmit` retires the idle watcher when a new turn starts, handing
-   delivery to the probe instead of queuing it behind a long-running turn.
+   `UserPromptSubmit` pauses idle delivery while retaining the watcher.
+   `Interrupt` marks the interrupted turn idle so that watcher resumes delivery;
+   its handler finishes within the host's short interrupt timeout.
 4. SQLite transactions and 30-second delivery leases arbitrate overlapping
    hooks. Queue failures release the lease and retry with bounded backoff.
    Process crashes leave a recoverable lease.
@@ -147,8 +157,8 @@ the PR once and reconcile the jobs before returning to idle.
    the current time, coalescing missed ticks into one prompt. Interval jobs
    retain their original phase; cron jobs follow their timezone's calendar
    and daylight-saving rules.
-6. `SessionStart` preserves jobs on resume/compaction and invalidates old
-   watchers. `SessionEnd` deletes only its session's jobs and keeps a small
+6. `SessionStart` preserves jobs and active watcher state on resume/compaction.
+   `SessionEnd` deletes only its session's jobs and keeps a small
    ended-session marker so an in-flight MCP call cannot recreate them.
 
 Practical limits:
@@ -156,6 +166,9 @@ Practical limits:
 - Requires a running Codex host/daemon able to accept `codex queue`. Async
   hook output alone does **not** start a new turn. This is a session scheduler,
   not an OS service that launches Codex after shutdown.
+- After an interrupted turn, Codex 0.157.1 pauses consumption of queued work.
+  Cronex still delivers due prompts into that queue; they execute when you
+  explicitly resume queued work in Codex. Cronex does not clear the host pause.
 - During active work, delivery happens at supported tool boundaries or via
   Codex's queue. A hook cannot interrupt an individual long-running model
   request or tool. Hosted tools may not emit `PostToolUse`.
@@ -167,8 +180,8 @@ Practical limits:
 - A hard kill can skip `SessionEnd`, leaving persisted jobs. They remain
   isolated to that session ID and can be inspected/deleted upon resuming it.
 - Hooks fail open on database errors, logging diagnostics to stderr. This
-  preserves the agent's work, but a failed Stop watcher cannot guarantee a
-  wake until a later Stop runs. The lightweight probe retries on the next tool.
+  preserves the agent's work, but a failed watcher cannot guarantee a
+  wake until a later Stop or UserPromptSubmit starts its replacement. The lightweight probe retries on the next tool.
 - Local session scoping prevents accidental cross-session access; it is not
   an authentication boundary against another process with access to your
   user account/database. Cronex does not expose an HTTP listener.
@@ -187,7 +200,8 @@ routing, competing database connections, lease recovery, queue failures,
 cleanup, coalescing, expiry, timezone scheduling, hook output, and idempotent
 installation. `make smoke` requires Node 22+, Python 3, and Codex on PATH. It
 uses an isolated temporary Codex home and a local fake Responses endpoint to
-verify actual MCP routing, idle wakeup, PostToolUse delivery, and SessionEnd cleanup. It trusts only
+verify actual MCP routing, idle wakeup, active-turn handoff, recurring delivery,
+interruption recovery, batching, and SessionEnd cleanup. It trusts only
 the generated test hooks in that temporary instance.
 
 The integration follows Codex's [hook contract](https://learn.chatgpt.com/docs/hooks).

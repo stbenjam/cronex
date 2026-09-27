@@ -1,6 +1,7 @@
 package cronex
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -13,7 +14,12 @@ import (
 type HookInput struct {
 	SessionID string `json:"session_id"`
 	Event     string `json:"hook_event_name"`
+	TurnID    string `json:"turn_id"`
+	AgentID   string `json:"agent_id"`
 }
+
+// Subagent tool hooks carry the parent's session_id and the child's agent_id.
+func (in HookInput) IsSubagent() bool { return in.AgentID != "" && in.AgentID != in.SessionID }
 
 // Ignore large tool_input/tool_response values without interpreting their text.
 func ReadHook(r io.Reader) (HookInput, error) {
@@ -61,22 +67,44 @@ func Probe(ctx context.Context, s *Store, session string, out io.Writer, now tim
 
 type QueueFunc func(context.Context, string, string) error
 
+// Continue draining stderr after the limit so a noisy queue process cannot block.
+type boundedOutput struct{ buf bytes.Buffer }
+
+func (b *boundedOutput) String() string { return b.buf.String() }
+
+func (b *boundedOutput) Write(p []byte) (int, error) {
+	n := len(p)
+	if left := 4096 - b.buf.Len(); left > 0 {
+		_, _ = b.buf.Write(p[:min(left, n)])
+	}
+	return n, nil
+}
+
 func CodexQueue(binary string) QueueFunc {
 	return func(ctx context.Context, session, prompt string) error {
 		ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		defer cancel()
 		// Never invoke a shell: prompts are data, even if they contain shell syntax.
 		cmd := exec.CommandContext(ctx, binary, "queue", "--thread", session, "--message", prompt)
+		var stderr boundedOutput
+		cmd.Stderr = &stderr
 		if err := cmd.Run(); err != nil {
-			return fmt.Errorf("codex queue failed: %w", err)
+			detail := strings.TrimSpace(stderr.String())
+			// Some wrappers echo arguments. Suppress diagnostics containing even
+			// the captured prefix of the scheduled prompt.
+			if prompt != "" && strings.Contains(detail, prompt[:min(len(prompt), 64)]) {
+				detail = "[diagnostics containing scheduled prompt omitted]"
+			}
+			return fmt.Errorf("codex queue failed: %w: %s", err, detail)
 		}
 		return nil
 	}
 }
 
-// Watch is owned by Codex's async Stop hook. Its output cannot wake Codex;
+// Watch is owned by a Codex async Stop or UserPromptSubmit hook. Its output cannot wake Codex;
 // queue explicitly addresses the owning thread instead. No model tokens are
-// used while waiting. A generation fences older overlapping Stop watchers.
+// used while waiting. Active turns pause delivery, while retaining a watcher
+// for Interrupt. A generation limits overlapping hooks to one surviving watcher.
 func Watch(ctx context.Context, s *Store, session string, queue QueueFunc, poll time.Duration, log io.Writer) error {
 	generation, err := s.StartWatch(ctx, session)
 	if err != nil || generation == "" {
@@ -96,10 +124,13 @@ func Watch(ctx context.Context, s *Store, session string, queue QueueFunc, poll 
 			}
 			if len(d.Jobs) > 0 {
 				// Recheck shutdown/supersession after taking the lease.
-				active, _, err = s.WatchState(ctx, session, generation, time.Now())
+				active, err = s.CanDeliver(ctx, session, generation)
 				if err != nil || !active {
 					_ = s.Complete(ctx, d, false, time.Now())
-					return err
+					if err != nil {
+						return err
+					}
+					continue
 				}
 				deliveryErr := queue(ctx, session, Prompt(d.Jobs))
 				if err := s.Complete(ctx, d, deliveryErr == nil, time.Now()); err != nil {

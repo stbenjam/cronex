@@ -102,7 +102,7 @@ func TestWatcherQueuesOwningSessionAndRetriesFailure(t *testing.T) {
 	}
 }
 
-func TestWatcherExitsWhenSessionEndsOrJobsAreDeleted(t *testing.T) {
+func TestWatcherCleanupAndCancellation(t *testing.T) {
 	for _, end := range []bool{true, false} {
 		t.Run(map[bool]string{true: "end", false: "delete"}[end], func(t *testing.T) {
 			s, _ := testStore(t)
@@ -137,11 +137,12 @@ func TestWatcherExitsWhenSessionEndsOrJobsAreDeleted(t *testing.T) {
 				err = s.EndSession(ctx, "A")
 			} else {
 				_, err = s.Delete(ctx, "A", j.ID)
+				cancel()
 			}
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err = <-done; err != nil {
+			if err = <-done; err != nil && !errors.Is(err, context.Canceled) {
 				t.Fatal(err)
 			}
 			if calls.Load() != 0 {
@@ -170,5 +171,21 @@ func TestQueueTreatsPromptAsData(t *testing.T) {
 	want := "queue\n--thread\nsession A\n--message\n" + prompt + "\n"
 	if string(raw) != want {
 		t.Fatalf("arguments changed: %q", raw)
+	}
+}
+
+func TestQueueReportsBoundedDiagnostics(t *testing.T) {
+	dir := t.TempDir()
+	binary := filepath.Join(dir, "queue")
+	if err := os.WriteFile(binary, []byte("#!/bin/sh\necho 'daemon unavailable' >&2\nexit 1\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	err := CodexQueue(binary)(ctx, "A", "scheduled task")
+	if err == nil || !strings.Contains(err.Error(), "daemon unavailable") {
+		t.Fatalf("missing diagnostic: %v", err)
+	}
+	var out boundedOutput
+	if n, err := io.Copy(&out, strings.NewReader(strings.Repeat("x", 10000))); err != nil || n != 10000 || len(out.String()) != 4096 {
+		t.Fatalf("diagnostic limit: %d %v %d", n, err, len(out.String()))
 	}
 }

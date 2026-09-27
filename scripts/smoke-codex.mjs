@@ -28,10 +28,14 @@ const model = http.createServer(async (req, res) => {
   requests.push(JSON.parse(body));
   const id = `resp_${requests.length}`;
   const input = requests.at(-1).input;
-  const probe = JSON.stringify(input).includes('CRONEX_POST_TOOL_TURN') &&
-    !input.some(item => item.type === 'function_call_output' && item.call_id === 'cronex_probe_tool');
+  const lastUser = JSON.stringify(input.filter(item => item.role === 'user').at(-1));
+  if (lastUser.includes('CRONEX_HOLD_MODEL')) return;
+  const toolCase = lastUser.match(/CRONEX_TOOL_CASE:(\w+)/)?.[1];
+  const toolID = toolCase ? `cronex_${toolCase}` : 'cronex_probe_tool';
+  const probe = (Boolean(toolCase) || lastUser.includes('CRONEX_POST_TOOL_TURN')) &&
+    !input.some(item => item.type === 'function_call_output' && item.call_id === toolID);
   const message = probe ? { id: `fc_${requests.length}`, type: 'function_call', name: 'exec_command',
-    call_id: 'cronex_probe_tool', arguments: JSON.stringify({ cmd: 'sleep 2', yield_time_ms: 10000 }), status: 'completed' } :
+    call_id: toolID, arguments: JSON.stringify({ cmd: toolCase ? 'sleep 4' : 'sleep 2', yield_time_ms: 10000 }), status: 'completed' } :
     { id: `msg_${requests.length}`, type: 'message', role: 'assistant', status: 'completed',
     phase: 'final_answer', content: [{ type: 'output_text', text: 'Smoke test turn complete.', annotations: [] }] };
   const response = { id, object: 'response', model: 'test-model', status: 'completed', output: [message],
@@ -106,6 +110,15 @@ try {
     assert.ok(!result.isError, JSON.stringify(result));
     return result.structuredContent;
   }
+  // Codex runs SessionStart at the first turn, not at thread/start. Direct RPC
+  // tool calls before that point intentionally cannot create scheduled work.
+  const completed = turn => notifications.some(n => n.method === 'turn/completed' && n.params.turn.id === turn.turn.id);
+  async function warm(threadId) {
+    const turn = await rpc('turn/start', { threadId, input: [{ type: 'text', text: 'Initialize session.' }] });
+    await until(() => completed(turn), 'session registration');
+  }
+  await warm(a);
+  await warm(b);
   const job = await call(a, 'CronCreate', { prompt: 'CRONEX_SMOKE_WAKE_A', every_seconds: 2, recurring: false });
   assert.equal(job.session_id, a);
   assert.equal((await call(b, 'CronList')).jobs.length, 0);
@@ -114,13 +127,72 @@ try {
   await until(() => requests.some(r => JSON.stringify(r.input).includes('CRONEX_SMOKE_WAKE_A')), 'async Stop to queue to model wakeup', 20000);
   assert.equal((await call(a, 'CronList')).jobs.length, 0, 'one-shot is acknowledged');
   assert.ok(notifications.some(n => n.method === 'hook/started'), 'Codex ran hooks');
-  // B has never stopped, so it has no idle watcher: only PostToolUse can deliver.
+  // Active delivery must use PostToolUse even though an idle watcher exists.
   await call(b, 'CronCreate', { prompt: 'CRONEX_SMOKE_PROBE_B', every_seconds: 1, recurring: false });
-  await rpc('turn/start', { threadId: b, input: [{ type: 'text', text: 'CRONEX_POST_TOOL_TURN: run the smoke test command.' }] });
+  const probeTurn = await rpc('turn/start', { threadId: b, input: [{ type: 'text', text: 'CRONEX_POST_TOOL_TURN: run the smoke test command.' }] });
   await until(() => requests.some(r => JSON.stringify(r.input).includes('CRONEX_SMOKE_PROBE_B')), 'PostToolUse prompt delivery');
   const probeRequest = requests.find(r => JSON.stringify(r.input).includes('CRONEX_SMOKE_PROBE_B'));
   assert.ok(probeRequest.input.some(item => item.type === 'function_call_output' && item.call_id === 'cronex_probe_tool'), 'original tool output preserved');
   assert.equal((await call(b, 'CronList')).jobs.length, 0, 'probe acknowledged the one-shot');
+  const contains = (r, marker) => JSON.stringify(r.input).includes(marker);
+  const isWake = (r, marker) => JSON.stringify(r.input.filter(item => item.role === 'user').at(-1)).includes(marker);
+  await until(() => completed(probeTurn), 'probe turn finished');
+
+  // A live idle watcher must pause for a user turn and let PostToolUse deliver.
+  const handoffMarker = 'CRONEX_ACTIVE_HANDOFF';
+  await call(b, 'CronCreate', { prompt: handoffMarker, every_seconds: 2, recurring: false });
+  const handoff = await rpc('turn/start', { threadId: b, input: [{ type: 'text', text: 'CRONEX_TOOL_CASE:handoff' }] });
+  await until(() => requests.some(r => contains(r, handoffMarker)), 'active-turn delivery');
+  const handoffRequest = requests.find(r => contains(r, handoffMarker));
+  assert.ok(handoffRequest.input.some(item => item.type === 'function_call_output' && item.call_id === 'cronex_handoff'), 'handoff delivered at tool boundary');
+  assert.ok(!isWake(handoffRequest, handoffMarker), 'handoff did not queue a separate turn');
+  await until(() => completed(handoff), 'handoff turn finished');
+
+  // Recurring jobs must survive two complete wake/Stop cycles.
+  const recurringMarker = 'CRONEX_RECURRING_WAKE';
+  const recurring = await call(a, 'CronCreate', { prompt: recurringMarker, every_seconds: 2 });
+  await rpc('turn/start', { threadId: a, input: [{ type: 'text', text: 'Arm recurring cron.' }] });
+  await until(() => requests.filter(r => isWake(r, recurringMarker)).length >= 2, 'two recurring wakeups', 20000);
+  await call(a, 'CronDelete', { id: recurring.id });
+
+  // Exercise both interruption of the first turn and interruption after idle.
+  for (const firstTurn of [true, false]) {
+    const threadId = (await rpc('thread/start', { cwd: workspace, config: { bypass_hook_trust: true } })).thread.id;
+    if (!firstTurn) {
+      const initial = await rpc('turn/start', { threadId, input: [{ type: 'text', text: 'Finish normally.' }] });
+      await until(() => completed(initial), 'initial turn finished');
+    }
+    const marker = `CRONEX_INTERRUPT_WAKE_${firstTurn}`;
+    const turn = await rpc('turn/start', { threadId, input: [{ type: 'text', text: `CRONEX_HOLD_MODEL_${threadId}` }] });
+    await until(() => requests.some(r => contains(r, `CRONEX_HOLD_MODEL_${threadId}`)), 'interruptible request started');
+    await call(threadId, 'CronCreate', { prompt: marker, every_seconds: 3, recurring: false });
+    await rpc('turn/interrupt', { threadId, turnId: turn.turn.id });
+    await until(() => completed(turn), 'turn interrupted');
+    // Codex pauses queue consumption on interruption. Delivery must still
+    // reach that queue without overriding the user's host-level pause.
+    await until(async () => (await rpc('thread/queue/list', { threadId })).data.some(q => JSON.stringify(q.input).includes(marker)), 'queued delivery after interruption');
+    assert.ok(!requests.some(r => isWake(r, marker)), 'interruption pause respected');
+    await rpc('thread/queue/start', { threadId }); // Simulate explicit user resume.
+    await until(() => requests.some(r => isWake(r, marker)), 'queued prompt after explicit resume', 15000);
+    await until(async () => (await call(threadId, 'CronList')).jobs.length === 0, 'interrupted one-shot acknowledged');
+    await rpc('thread/archive', { threadId });
+  }
+
+  // Two long prompts fit the configured context budget; a ninth due job must
+  // survive the first batch and arrive at a later hook/queued turn.
+  const batchThread = (await rpc('thread/start', { cwd: workspace, config: { bypass_hook_trust: true } })).thread.id;
+  await warm(batchThread);
+  const markers = [];
+  for (let i = 0; i < 9; i++) {
+    const marker = `CRONEX_BATCH_${i}_END`;
+    markers.push(marker);
+    await call(batchThread, 'CronCreate', { prompt: (i < 2 ? 'detail '.repeat(2200) : '') + marker, every_seconds: 2, recurring: false });
+  }
+  await rpc('turn/start', { threadId: batchThread, input: [{ type: 'text', text: 'CRONEX_TOOL_CASE:batch' }] });
+  await until(() => markers.every(marker => requests.some(r => contains(r, marker))), 'complete batched prompts');
+  await until(async () => (await call(batchThread, 'CronList')).jobs.length === 0, 'all batch jobs acknowledged');
+  await rpc('thread/archive', { threadId: batchThread });
+
   const other = await call(b, 'CronCreate', { prompt: 'Keep B', every_seconds: 28800 });
   await call(a, 'CronCreate', { prompt: 'Clean up A', every_seconds: 28800 });
   await rpc('thread/archive', { threadId: a });
@@ -130,7 +202,7 @@ try {
     const rows = JSON.parse(execFileSync('python3', ['-c', query, join(root, 'jobs.sqlite3')], { encoding: 'utf8' }));
     return rows.length === 1 && rows[0][0] === b && rows[0][1] === other.id;
   }, 'SessionEnd cleanup');
-  console.log('PASS: real Codex MCP metadata, session isolation, async Stop, queue wakeup, PostToolUse delivery, one-shot acknowledgement, SessionEnd cleanup.');
+  console.log('PASS: real Codex session routing, idle wakeup, active-turn handoff, recurring delivery, first-turn/idle interruption recovery, complete batches, and SessionEnd cleanup.');
 } catch (error) {
   console.error(error);
   console.error('Codex stderr:', stderr.slice(-6000));

@@ -47,6 +47,10 @@ func Open(path string, initialize bool) (*Store, error) {
 CREATE TABLE IF NOT EXISTS sessions (
  id TEXT PRIMARY KEY, ended INTEGER NOT NULL DEFAULT 0, generation TEXT NOT NULL DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS session_state (
+ session_id TEXT PRIMARY KEY REFERENCES sessions(id), turn_id TEXT NOT NULL DEFAULT '',
+ idle INTEGER NOT NULL DEFAULT 0
+);
 CREATE TABLE IF NOT EXISTS jobs (
  id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id),
  body TEXT NOT NULL, next_ms INTEGER NOT NULL, expires_ms INTEGER,
@@ -70,10 +74,20 @@ func (s *Store) EnsureSession(ctx context.Context, id string, restart bool) erro
 	}
 	query := `INSERT INTO sessions(id) VALUES (?) ON CONFLICT(id) DO NOTHING`
 	if restart {
-		query = `INSERT INTO sessions(id) VALUES (?) ON CONFLICT(id) DO UPDATE SET ended=0, generation=''`
+		query = `INSERT INTO sessions(id) VALUES (?) ON CONFLICT(id) DO UPDATE SET ended=0, generation=CASE WHEN ended=1 THEN '' ELSE generation END`
 	}
-	_, err := s.db.ExecContext(ctx, query, id)
-	return err
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err = tx.ExecContext(ctx, query, id); err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `INSERT INTO session_state(session_id) SELECT id FROM sessions WHERE id=? AND ended=0 ON CONFLICT DO NOTHING`, id); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *Store) Create(ctx context.Context, session string, in CreateInput, now time.Time) (Job, error) {
@@ -90,15 +104,19 @@ func (s *Store) Create(ctx context.Context, session string, in CreateInput, now 
 	if j.ExpiresAt != nil {
 		expiry = j.ExpiresAt.UnixMilli()
 	}
+	// Reclaim expired rows on a write path, leaving the common probe read-only.
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM jobs WHERE session_id=? AND expires_ms<=?`, session, now.UnixMilli()); err != nil {
+		return j, err
+	}
 	result, err := s.db.ExecContext(ctx, `INSERT INTO jobs(id,session_id,body,next_ms,expires_ms)
-SELECT ?,?,?,?,? WHERE EXISTS(SELECT 1 FROM sessions WHERE id=? AND ended=0)`,
+SELECT ?,?,?,?,? WHERE EXISTS(SELECT 1 FROM sessions WHERE id=? AND ended=0 AND EXISTS(SELECT 1 FROM session_state WHERE session_id=sessions.id))`,
 		j.ID, session, string(body), j.NextRunAt.UnixMilli(), expiry, session)
 	if err != nil {
 		return j, err
 	}
 	n, err := result.RowsAffected()
 	if err == nil && n == 0 {
-		err = errors.New("session has ended or is not registered")
+		err = errors.New("session has ended or is not registered; scheduling requires the root SessionStart hook (subagents are unsupported)")
 	}
 	return j, err
 }
@@ -142,16 +160,31 @@ func (s *Store) EndSession(ctx context.Context, session string) error {
 	if _, err = tx.ExecContext(ctx, `INSERT INTO sessions(id,ended) VALUES (?,1) ON CONFLICT(id) DO UPDATE SET ended=1,generation=''`, session); err != nil {
 		return err
 	}
+	if _, err = tx.ExecContext(ctx, `DELETE FROM session_state WHERE session_id=?`, session); err != nil {
+		return err
+	}
 	if _, err = tx.ExecContext(ctx, `DELETE FROM jobs WHERE session_id=?`, session); err != nil {
 		return err
 	}
 	return tx.Commit()
 }
 
-// A new user turn hands delivery back to PostToolUse. Otherwise an old idle
-// watcher could queue a due job behind a long turn instead of injecting it.
-func (s *Store) SuspendWatch(ctx context.Context, session string) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE sessions SET generation='' WHERE id=?`, session)
+// BeginTurn pauses idle delivery without killing the watcher. Interrupt can
+// therefore return to idle without launching a long-lived Interrupt hook.
+func (s *Store) BeginTurn(ctx context.Context, session, turn string) error {
+	if turn == "" {
+		return errors.New("hook is missing turn_id")
+	}
+	_, err := s.db.ExecContext(ctx, `UPDATE session_state SET turn_id=?,idle=0 WHERE session_id=?`, turn, session)
+	return err
+}
+
+// FinishTurn ignores delayed Stop/Interrupt events belonging to older turns.
+func (s *Store) FinishTurn(ctx context.Context, session, turn string) error {
+	if turn == "" {
+		return errors.New("hook is missing turn_id")
+	}
+	_, err := s.db.ExecContext(ctx, `UPDATE session_state SET idle=1 WHERE session_id=? AND turn_id=?`, session, turn)
 	return err
 }
 
@@ -178,10 +211,11 @@ func (s *Store) Claim(ctx context.Context, session, generation string, now time.
 	defer tx.Rollback()
 	var ended bool
 	var current string
-	if err = tx.QueryRowContext(ctx, `SELECT ended,generation FROM sessions WHERE id=?`, session).Scan(&ended, &current); err != nil {
+	var idle bool
+	if err = tx.QueryRowContext(ctx, `SELECT ended,generation,COALESCE((SELECT idle FROM session_state WHERE session_id=sessions.id),0) FROM sessions WHERE id=?`, session).Scan(&ended, &current, &idle); err != nil {
 		return d, err
 	}
-	if ended || (generation != "" && current != generation) {
+	if ended || (generation != "" && (current != generation || !idle)) {
 		return d, nil
 	}
 	rows, err := tx.QueryContext(ctx, `SELECT body FROM jobs WHERE session_id=? AND next_ms<=? AND lease_until_ms<=? AND (expires_ms IS NULL OR expires_ms>?) ORDER BY next_ms,id LIMIT 8`, session, now.UnixMilli(), now.UnixMilli(), now.UnixMilli())
@@ -260,11 +294,18 @@ func (s *Store) StartWatch(ctx context.Context, session string) (string, error) 
 	return generation, err
 }
 
+func (s *Store) CanDeliver(ctx context.Context, session, generation string) (bool, error) {
+	var ready bool
+	err := s.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sessions JOIN session_state ON session_state.session_id=sessions.id WHERE sessions.id=? AND ended=0 AND generation=? AND idle=1)`, session, generation).Scan(&ready)
+	return ready, err
+}
+
 func (s *Store) WatchState(ctx context.Context, session, generation string, now time.Time) (bool, time.Duration, error) {
 	var active bool
 	var next sql.NullInt64
 	err := s.db.QueryRowContext(ctx, `SELECT ended=0 AND generation=?,
- (SELECT MIN(MAX(next_ms,lease_until_ms)) FROM jobs WHERE session_id=? AND (expires_ms IS NULL OR expires_ms>?))
+ (SELECT MIN(MAX(next_ms,lease_until_ms)) FROM jobs WHERE session_id=? AND (expires_ms IS NULL OR expires_ms>?)
+ AND EXISTS(SELECT 1 FROM session_state WHERE session_id=jobs.session_id AND idle=1))
  FROM sessions WHERE id=?`, generation, session, now.UnixMilli(), session).Scan(&active, &next)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, 0, nil
@@ -273,7 +314,7 @@ func (s *Store) WatchState(ctx context.Context, session, generation string, now 
 		return false, 0, fmt.Errorf("watch state: %w", err)
 	}
 	if !next.Valid {
-		return false, 0, nil
+		return active, time.Second, nil
 	}
 	return active, time.UnixMilli(next.Int64).Sub(now), nil
 }

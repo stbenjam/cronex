@@ -53,6 +53,11 @@ func TestMCPClientToolLifecycle(t *testing.T) {
 	if r.IsError {
 		t.Fatalf("create: %+v", r)
 	}
+	// Only a root SessionStart (or explicit manual binding) registers ownership.
+	unregistered, err := cs.CallTool(timeout, &mcp.CallToolParams{Name: "CronCreate", Arguments: map[string]any{"prompt": "unsupported", "every_seconds": 60}, Meta: mcp.Meta{"threadId": "unregistered-child"}})
+	if err != nil || !unregistered.IsError {
+		t.Fatalf("unregistered session accepted: %+v %v", unregistered, err)
+	}
 	jobs, err := s.List(ctx, "A", time.Now())
 	if err != nil || len(jobs) != 1 {
 		t.Fatalf("created: %+v %v", jobs, err)
